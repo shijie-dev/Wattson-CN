@@ -1,0 +1,503 @@
+import AppKit
+import SwiftUI
+
+/// One pane of Settings.
+///
+/// The column had grown past the height of a 13" screen. It is four panes now,
+/// split by what you are changing rather than evenly — the menu bar picker is a
+/// pane of its own because it is the one people come here for.
+enum SettingsTab: String, CaseIterable {
+    case menuBar
+    case panel
+    case notifications
+    case general
+
+    var title: String {
+        switch self {
+        case .menuBar: return L10n.text("Menu Bar")
+        case .panel: return L10n.text("Panel")
+        case .notifications: return L10n.text("Notifications")
+        case .general: return L10n.text("General")
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .menuBar: return "menubar.rectangle"
+        case .panel: return "rectangle.inset.filled"
+        case .notifications: return "bell"
+        case .general: return "gearshape"
+        }
+    }
+}
+
+/// What Settings has to remember across its contents being thrown away on
+/// close. Held by the window controller, for the reason `PanelState` is held
+/// by the app delegate: `@State` goes with the view.
+@MainActor
+final class SettingsState: ObservableObject {
+    /// Set when macOS refuses, which it does silently and permanently once the
+    /// user has said no — the switch alone would look broken.
+    @Published var deniedNotifications = false
+}
+
+struct SettingsView: View {
+    @ObservedObject var model: DeviceModel
+    let tab: SettingsTab
+    @ObservedObject var state: SettingsState
+
+    /// Just the one pane. The switching is the window's job, through a real
+    /// toolbar — SwiftUI's own `TabView` draws the old boxed tab strip on
+    /// macOS, which looks nothing like a settings window ought to.
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            switch tab {
+            case .menuBar: menuBar
+            case .panel: panel
+            case .notifications: notifications
+            case .general: general
+            }
+
+            // Every pane, not just General: it is what the window says about
+            // itself, and which pane you happen to be standing in is no reason
+            // for the version to be somewhere else.
+            Divider()
+            credits
+        }
+        .padding(20)
+        .frame(width: 380, alignment: .leading)
+        // Settings apply as you change them, so there is nothing to confirm —
+        // Escape and ⌘W close it, the way a settings window should.
+        .onExitCommand { NSApp.keyWindow?.close() }
+    }
+
+    /// No group heading on the single-subject panes: the window's title bar is
+    /// already saying it, and a settings window that captions every pane with
+    /// its own name reads like a form.
+    private var menuBar: some View {
+        Group {
+            // Each option previews what it would actually put up there, live —
+            // the labels alone did not tell you what you would get.
+            Picker(L10n.text("Show"), selection: $model.titleMode) {
+                ForEach(TitleMode.allCases) { mode in
+                    (Text(L10n.text(mode.label)) + preview(mode))
+                        .tag(mode)
+                }
+            }
+            .pickerStyle(.radioGroup)
+            .labelsHidden()
+
+            // Greyed out rather than hidden under icon-only, which keeps its
+            // icon regardless: it is still the setting every other mode will
+            // come back to.
+            plain {
+                Toggle(L10n.text("Show the icon beside the reading"), isOn: $model.showMenuBarIcon)
+                    .disabled(model.title(for: model.titleMode) == nil)
+            }
+
+            // Because the previews are live, they are also only as
+            // distinguishing as the moment you are reading them in. On battery
+            // four of these produce the same two strings, and somebody picking
+            // between them deserves to know that rather than conclude the
+            // options are duplicates.
+            Text(L10n.text("Previews are live, so several read alike on battery and differ once a charger is attached."))
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var panel: some View {
+        Group {
+            plain {
+                Toggle(L10n.text("Wattage graph"), isOn: $model.showSparkline)
+                Toggle(L10n.text("Connections"), isOn: $model.showDevices)
+                Toggle(L10n.text("Cable diagnostics"), isOn: $model.showCable)
+                    .disabled(!model.showDevices)
+                    .padding(.leading, 16)
+                Toggle(L10n.text("Vendor names"), isOn: $model.showVendors)
+                    .disabled(!model.showDevices)
+                    .padding(.leading, 16)
+                Toggle(L10n.text("This Mac's limits"), isOn: $model.showPortLimits)
+                Toggle(L10n.text("CPU speed"), isOn: $model.showThrottle)
+            }
+        }
+    }
+
+    private var notifications: some View {
+        Group {
+            group(L10n.text("What to announce")) {
+                Toggle(L10n.text("Chargers"), isOn: $model.announcePower)
+                Toggle(L10n.text("Warn when the battery drains on a charger"), isOn: $model.warnBatteryDrain)
+                    .disabled(!model.announcePower)
+                    .padding(.leading, 16)
+                Toggle(L10n.text("Contract changes"), isOn: $model.announceContract)
+                    .disabled(!model.announcePower)
+                    .padding(.leading, 16)
+                Toggle(L10n.text("Drives and cards"), isOn: $model.announceStorage)
+                Toggle(L10n.text("Everything else that plugs in"), isOn: $model.announceDevices)
+                // Last, and deliberately not indented under Chargers: this is
+                // the only switch that governs it. A connector can be wet with
+                // a peripheral in it or with nothing in it at all, so tying it
+                // to whether chargers are announced was never a decision — it
+                // was where the code happened to live.
+                Toggle(L10n.text("Warn when liquid is detected in a port"), isOn: $model.warnLiquid)
+            }
+
+            group(L10n.text("Where they show")) {
+                Toggle(L10n.text("Beside the menu bar"), isOn: $model.noticesInPanel)
+                Toggle(L10n.text("In Notification Center"), isOn: Binding(
+                    get: { model.noticesInCenter },
+                    set: { wanted in
+                        model.noticesInCenter = wanted
+                        // Permission is asked for here, when it is turned on,
+                        // and the switch goes back by itself if it is refused.
+                        guard wanted else { return }
+                        model.enableNotificationCenter { granted in
+                            state.deniedNotifications = !granted
+                        }
+                    }
+                ))
+                if state.deniedNotifications {
+                    Text(L10n.text("macOS is not letting Wattson post notifications. Turn them on for Wattson in System Settings › Notifications."))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var general: some View {
+        Group {
+            if model.lowPower.isSupported {
+                group(L10n.text("Low Power Mode")) {
+                    if model.lowPowerPromptless == true {
+                        Text(L10n.text("The switch in the panel can change Low Power Mode without asking for a password."))
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button(L10n.text("Revoke Permission…")) { model.removeLowPowerRule() }
+                            .disabled(model.lowPowerBusy)
+                    } else {
+                        Text(L10n.text("Changing Low Power Mode needs root, which macOS grants no other way. The switch in the panel will offer to set this up."))
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            group(L10n.text("Startup")) {
+                Toggle(L10n.text("Launch at login"), isOn: Binding(
+                    get: { model.launchAtLogin },
+                    set: { model.setLaunchAtLogin($0) }
+                ))
+            }
+
+            group(L10n.text("Connection History")) {
+                Text(L10n.text("What has been plugged in and when, kept between launches so a device's card can say when it last came and went."))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(L10n.text("Clear History…")) { confirmClearHistory() }
+                    .disabled(model.log.events.isEmpty)
+            }
+
+            group(L10n.text("Debug Options")) {
+                Toggle(L10n.text("Show raw hardware capture"), isOn: $model.showDebugOptions)
+                Text(L10n.text("Adds a diagnostic capture command to the menu. Reports can be large and may include serial numbers."))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Asked before it happens, because there is nothing to undo it with and
+    /// the log is the only record of anything that is no longer plugged in.
+    private func confirmClearHistory() {
+        let alert = NSAlert()
+        alert.messageText = L10n.text("Clear the connection history?")
+        alert.informativeText = L10n.text("""
+        Wattson will forget every attach and detach it has recorded, \
+        for every device. Anything still plugged in will start a fresh \
+        history from now.
+
+        This cannot be undone.
+        """)
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: L10n.text("Clear"))
+        alert.addButton(withTitle: L10n.text("Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        model.clearHistory()
+    }
+
+    /// What this is, where it lives, and who to blame for it.
+    private var credits: some View {
+        HStack(spacing: 6) {
+            Link(destination: URL(string: "https://github.com/TheFilipcom4607/wattson")!) {
+                HStack(spacing: 5) {
+                    GitHubMark()
+                        .frame(width: 12, height: 12)
+                    Text(L10n.text("Wattson \(Bundle.main.shortVersion)"))
+                }
+            }
+            .help(L10n.text("github.com/TheFilipcom4607/wattson"))
+
+            Text(L10n.text("·")).foregroundStyle(.tertiary)
+
+            HStack(spacing: 0) {
+                Text(L10n.text("made by ")).foregroundStyle(.secondary)
+                Link("thefilip", destination: URL(string: "https://github.com/TheFilipcom4607")!)
+                    .help(L10n.text("github.com/TheFilipcom4607"))
+            }
+        }
+        .font(.system(size: 11))
+        .buttonStyle(.plain)
+    }
+
+    /// Icon and reading, as the menu bar would show them, so switching the
+    /// icon off is visible here too. Icon-only gets just its icon, rather than
+    /// the words "icon only" sitting in the preview column where every other
+    /// row shows a live reading: it read as a value the mode produces, which is
+    /// the one thing it is not.
+    private func preview(_ mode: TitleMode) -> Text {
+        var preview = Text(L10n.text("   "))
+        if model.drawsIcon(for: mode) {
+            preview = preview + Text(icon(model.menuBarIcon(for: mode)))
+                .baselineOffset(-1)
+            if model.title(for: mode) != nil { preview = preview + Text(L10n.text(" ")) }
+        }
+        if let title = model.title(for: mode) {
+            preview = preview + Text(L10n.text(title))
+        }
+        return preview.foregroundColor(.secondary)
+    }
+
+    private func icon(_ icon: MenuBarIcon) -> Image {
+        switch icon {
+        case .battery(let percent, let charging, let lowPower):
+            return Image(nsImage: BatteryGlyph.menuBarImage(
+                percent: percent, charging: charging, lowPower: lowPower
+            ))
+        case .symbol(let name):
+            return Image(systemName: name)
+        }
+    }
+
+    private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(L10n.text(title.uppercased()))
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.tertiary)
+            content()
+                .toggleStyle(.checkbox)
+        }
+    }
+
+    /// A group with nothing to caption it, for a pane about one thing.
+    private func plain<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            content()
+                .toggleStyle(.checkbox)
+        }
+    }
+}
+
+/// Holds the settings window, which the accessory-mode app has to manage itself.
+///
+/// The panes are switched by a real `NSToolbar` in `.preference` style, which is
+/// what gives a settings window the look people expect of one — big centred
+/// icons under the title bar, the title naming the pane you are in. SwiftUI has
+/// no equivalent outside a `Settings` scene, which a menu bar app does not have.
+@MainActor
+final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate {
+    /// Made on the first opening and kept for good, toolbar and all; its
+    /// contents come and go with each opening instead, as the panel's do.
+    private var window: NSWindow?
+    /// Present only while the window is open. See `teardownContent`.
+    private var hosting: NSHostingController<SettingsView>?
+    private var model: DeviceModel?
+    private var tab: SettingsTab = .menuBar
+    private let state = SettingsState()
+    /// Where the title bar was when the window closed. Giving the contents
+    /// back collapses the window, which moves it.
+    private var topLeft: NSPoint?
+
+    func show(model: DeviceModel) {
+        self.model = model
+        if window == nil {
+            // Built from the hosting controller so the window sizes to the
+            // content rather than to a hard-coded height that has to be kept
+            // in step with it.
+            let hosting = makeHosting(model: model)
+            let window = NSWindow(contentViewController: hosting)
+            window.styleMask = [.titled, .closable]
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+
+            let toolbar = NSToolbar(identifier: "settings")
+            toolbar.delegate = self
+            toolbar.allowsUserCustomization = false
+            toolbar.displayMode = .iconAndLabel
+            toolbar.selectedItemIdentifier = NSToolbarItem.Identifier(tab.rawValue)
+            window.toolbar = toolbar
+            window.toolbarStyle = .preference
+
+            window.title = tab.title
+            window.center()
+            self.hosting = hosting
+            self.window = window
+        } else if hosting == nil, let window {
+            let hosting = makeHosting(model: model)
+            window.contentViewController = hosting
+            self.hosting = hosting
+            window.fit(to: hosting.view, topLeft: topLeft)
+        }
+        // An .accessory app has no Dock icon, so it must ask for focus itself.
+        ActivationPolicy.claim()
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeHosting(model: DeviceModel) -> NSHostingController<SettingsView> {
+        let hosting = NSHostingController(rootView: SettingsView(model: model, tab: tab, state: state))
+        // `resizeToFit` only runs on a tab change, which left the panes
+        // that grow *in place* clipped: the notifications pane sprouting
+        // the "macOS is not letting Wattson post notifications" line, and
+        // General swapping its Low Power text once the rule is installed.
+        // Publishing a preferred size makes the window follow those too.
+        hosting.sizingOptions = [.preferredContentSize]
+        return hosting
+    }
+
+    @objc private func selectTab(_ sender: NSToolbarItem) {
+        guard let tab = SettingsTab(rawValue: sender.itemIdentifier.rawValue), let model else { return }
+        self.tab = tab
+        window?.title = tab.title
+        hosting?.rootView = SettingsView(model: model, tab: tab, state: state)
+        resizeToFit()
+    }
+
+    /// Panes are different heights, so the window follows — growing downwards
+    /// from where its title bar already is, rather than from its bottom edge,
+    /// which is what every other settings window does.
+    private func resizeToFit() {
+        guard let window, let hosting else { return }
+        window.fit(to: hosting.view, animate: true)
+    }
+
+    /// Give the contents back once the window is closed, keeping the window.
+    ///
+    /// The panel already did this and Settings never did: the first
+    /// opening built a hosting controller that then lived as long as the app,
+    /// view tree, layer tree and all — about 5,000 live SwiftUI graph entries
+    /// measured after closing — still subscribed to the model with nothing on
+    /// screen. The window and its toolbar stay, as the popover does.
+    private func teardownContent() {
+        guard let window, !window.isVisible, hosting != nil else { return }
+        topLeft = NSPoint(x: window.frame.minX, y: window.frame.maxY)
+        hosting = nil
+        releaseHostedContent { window.contentViewController = $0 }
+    }
+
+    // MARK: - Toolbar
+
+    private var identifiers: [NSToolbarItem.Identifier] {
+        SettingsTab.allCases.map { NSToolbarItem.Identifier($0.rawValue) }
+    }
+
+    nonisolated func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        MainActor.assumeIsolated { identifiers }
+    }
+
+    nonisolated func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        MainActor.assumeIsolated { identifiers }
+    }
+
+    /// What makes the icons behave as a set of tabs rather than as buttons.
+    nonisolated func toolbarSelectableItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        MainActor.assumeIsolated { identifiers }
+    }
+
+    nonisolated func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier identifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        MainActor.assumeIsolated {
+            guard let tab = SettingsTab(rawValue: identifier.rawValue) else { return nil }
+            let item = NSToolbarItem(itemIdentifier: identifier)
+            item.label = tab.title
+            item.image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: tab.title)
+            item.target = self
+            item.action = #selector(selectTab(_:))
+            return item
+        }
+    }
+
+    /// Drop back to menu-bar-only once the *last* window goes away, which is
+    /// not necessarily this one. See `ActivationPolicy`.
+    ///
+    /// The contents go a runloop turn late, as the panel's do: AppKit is still
+    /// inside its own close when the delegate hears about it.
+    nonisolated func windowWillClose(_ notification: Notification) {
+        Task { @MainActor in
+            ActivationPolicy.relinquish(after: self.window)
+            self.teardownContent()
+        }
+    }
+}
+
+extension Bundle {
+    /// Info.plist is the only place the version is written. The fallback is
+    /// deliberately not a number: a second copy of it here would be wrong the
+    /// moment the real one moves, and has been.
+    var shortVersion: String {
+        object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+    }
+}
+
+/// GitHub's own mark, from octicons' `mark-github-16`.
+///
+/// Its one elliptical arc is converted to cubics here, so this stays a plain
+/// SwiftUI path with nothing to parse at runtime and no asset to ship.
+private struct GitHubMark: Shape {
+    func path(in rect: CGRect) -> Path {
+        // The mark is drawn on a 16 x 16 box, scaled into whatever it is given.
+        func p(_ x: CGFloat, _ y: CGFloat, _ rect: CGRect) -> CGPoint {
+            CGPoint(x: rect.minX + x / 16 * rect.width, y: rect.minY + y / 16 * rect.height)
+        }
+        var path = Path()
+        path.move(to: p(6.766, 11.328, rect))
+        path.addCurve(to: p(3.25, 7.672, rect), control1: p(4.703, 11.078, rect), control2: p(3.25, 9.594, rect))
+        path.addCurve(to: p(4, 5.484, rect), control1: p(3.25, 6.891, rect), control2: p(3.531, 6.047, rect))
+        path.addCurve(to: p(4.063, 3.422, rect), control1: p(3.797, 4.969, rect), control2: p(3.828, 3.875, rect))
+        path.addCurve(to: p(6.031, 4.125, rect), control1: p(4.688, 3.344, rect), control2: p(5.531, 3.672, rect))
+        path.addCurve(to: p(8.016, 3.844, rect), control1: p(6.625, 3.938, rect), control2: p(7.25, 3.844, rect))
+        path.addCurve(to: p(9.969, 4.109, rect), control1: p(8.781, 3.844, rect), control2: p(9.406, 3.938, rect))
+        path.addCurve(to: p(11.938, 3.422, rect), control1: p(10.453, 3.672, rect), control2: p(11.313, 3.344, rect))
+        path.addCurve(to: p(11.984, 5.469, rect), control1: p(12.156, 3.844, rect), control2: p(12.188, 4.937, rect))
+        path.addCurve(to: p(12.75, 7.672, rect), control1: p(12.484, 6.062, rect), control2: p(12.75, 6.859, rect))
+        path.addCurve(to: p(9.203, 11.312, rect), control1: p(12.75, 9.594, rect), control2: p(11.297, 11.047, rect))
+        path.addCurve(to: p(10.093, 13.266, rect), control1: p(9.734, 11.656, rect), control2: p(10.093, 12.406, rect))
+        path.addLine(to: p(10.093, 14.891, rect))
+        path.addCurve(to: p(10.953, 15.438, rect), control1: p(10.093, 15.359, rect), control2: p(10.484, 15.625, rect))
+        path.addCurve(to: p(16, 8.03, rect), control1: p(13.781, 14.359, rect), control2: p(16, 11.53, rect))
+        path.addCurve(to: p(7.984, 0, rect), control1: p(16, 3.61, rect), control2: p(12.406, 0, rect))
+        path.addCurve(to: p(0, 8.031, rect), control1: p(3.563, 0, rect), control2: p(0, 3.61, rect))
+        path.addCurve(to: p(5.172, 15.453, rect), control1: p(-0.009, 11.347, rect), control2: p(2.058, 14.314, rect))
+        path.addCurve(to: p(6, 14.906, rect), control1: p(5.594, 15.609, rect), control2: p(6, 15.328, rect))
+        path.addLine(to: p(6, 13.656, rect))
+        path.addCurve(to: p(5.25, 13.812, rect), control1: p(5.781, 13.75, rect), control2: p(5.5, 13.812, rect))
+        path.addCurve(to: p(3.172, 12.203, rect), control1: p(4.219, 13.812, rect), control2: p(3.61, 13.25, rect))
+        path.addCurve(to: p(2.453, 11.484, rect), control1: p(3, 11.781, rect), control2: p(2.812, 11.531, rect))
+        path.addCurve(to: p(2.203, 11.297, rect), control1: p(2.266, 11.469, rect), control2: p(2.203, 11.391, rect))
+        path.addCurve(to: p(2.828, 10.969, rect), control1: p(2.203, 11.109, rect), control2: p(2.516, 10.969, rect))
+        path.addCurve(to: p(4.078, 11.829, rect), control1: p(3.281, 10.969, rect), control2: p(3.672, 11.25, rect))
+        path.addCurve(to: p(5.109, 12.484, rect), control1: p(4.391, 12.281, rect), control2: p(4.718, 12.484, rect))
+        path.addCurve(to: p(6.109, 11.984, rect), control1: p(5.5, 12.484, rect), control2: p(5.75, 12.344, rect))
+        path.addCurve(to: p(6.766, 11.328, rect), control1: p(6.375, 11.719, rect), control2: p(6.579, 11.484, rect))
+        return path
+    }
+}

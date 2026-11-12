@@ -1,0 +1,21 @@
+{
+  "Sources/Wattson/PowerMonitor.swift": "2dee732abb028332e9bab8ddac0c952cad90d7ac316e765ba10eb892a49a8007",
+  "Sources/Wattson/SMCMonitor.swift": "223af9c1f44ff7620a862007c77b20d95506ac3aa9c299974213d2e2c6d43045",
+  "Sources/Wattson/PortMonitor.swift": "7bdcbad2c4036e7a54e41fe4023da474beebb45378d97cf0b0db4bfbe947eaa6",
+  "Sources/Wattson/SourceCapabilities.swift": "9c96efbdf747a29230dd5c5bcd5b02498b78c8ed3944d1c5d0aa74ae5237e9dc",
+  "Sources/Wattson/Scanner.swift": "7e289fbb4c36afbce92c2056c300dbce5e21efaec10c36511b74c45948afcc75",
+  "Sources/Wattson/BOSDescriptor.swift": "a9b458a5e8ba619a196f5a8fbc3b9e031c2f6f21e14f9a5ccd5a305d9ac515d4",
+  "Sources/Wattson/ThrottleMonitor.swift": "9ae67d5a303424bf89e391420a7d4ed0863615fc86dd6ee0908ca0963ce508eb",
+  "Sources/Wattson/DeviceModel.swift": "f30da3fa37446057578823ebd856f602b5fff75745e368725e02261cf347aaa1",
+  "Sources/Wattson/Models.swift": "919ff94fb2714de02f40006fddf0b41ccd09efea5516ce30ce65ad84501d01f2",
+  "Sources/Wattson/CableLimit.swift": "1c21344a1ae25247b79515595bdd6b6433100a5d68a5bc031773d665e116e586",
+  "Sources/Wattson/LinkBottleneck.swift": "5be3416f7f2200dafb96f27fbd0b2c5e96a75a88ef6d62e2361a4a280a5e563f",
+  "Sources/Wattson/PhyMonitor.swift": "99c40183a978909880c12e5cd90a2df2ef947b27f642a595bb9b66abcd05b583",
+  "Sources/Wattson/ThunderboltMonitor.swift": "6c47a443ca727b75b24ecc7ddc872087eb3642733992ff6177fe4d2afaebaf66",
+  "Sources/Wattson/DisplayMonitor.swift": "ac553c99c952befd729cf6f9be9dd21bf129ead5e8c9d94685f0c5275b4d4d69",
+  "Sources/Wattson/Volumes.swift": "7d243b5689645bb6af6c06cbe18cd6fb3303ec1fec573401b1ca3be01008ce18",
+  "Sources/Wattson/PortStats.swift": "a5e7080e70922d7070ae4eb4178a9adbb8c0c2ad75f2cd10cd33552bd4b3bd3a",
+  "Sources/Wattson/ConnectionLog.swift": "ed320f4490c29304175884783dbb41a75ff167f4af1a37964b850aba51da146d",
+  "Sources/Wattson/SelfTest.swift": "dd407b687d56c89f4f965293dc84a23b38962d50aa66d57e2ebc733b7d289328",
+  "Sources/Wattson/JSONOutput.swift": "8b8c9addc5427c91736593c0663fca052362a8cfa041159cb620a91d0ab29097"
+}

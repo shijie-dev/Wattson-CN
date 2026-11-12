@@ -1,0 +1,732 @@
+import Foundation
+import IOKit
+
+/// One point on the sparkline.
+struct PowerSample: Identifiable, Hashable {
+    let id = UUID()
+    let watts: Double
+    /// Whether this reading came from the wall or from the battery.
+    let charging: Bool
+    let at = Date()
+}
+
+/// One PD voltage/current pair the attached charger advertises.
+struct PDProfile: Identifiable, Hashable {
+    let id: Int
+    let volts: Double
+    let amps: Double
+    var watts: Double { volts * amps }
+}
+
+/// What the pack itself says about its condition.
+///
+/// None of this moves on the timescale the rest of the panel does — a cycle
+/// count changes a few times a month — so it is read on the same tick as
+/// everything else purely because the property dictionary is already open.
+///
+/// The gauge publishes a great deal more than this under `BatteryData`
+/// (per-cell voltages, resistance tables, a daily state-of-charge history).
+/// What is taken here is the part whose meaning is unambiguous from its own
+/// name; the rest would need a decode nobody outside Apple can check.
+struct BatteryHealth: Hashable {
+    var cycleCount: Int?
+    /// What this pack's chemistry is rated for. 1000 on current Apple silicon.
+    var designCycleCount: Int?
+    /// Milliamp-hours the pack was built to hold.
+    var designCapacity: Double?
+    /// Milliamp-hours it currently holds — the figure Apple's own "Maximum
+    /// Capacity" is derived from.
+    var nominalChargeCapacity: Double?
+    /// Degrees Celsius.
+    var temperature: Double?
+    /// The warmest and coldest the pack has ever been, in whole degrees.
+    var maximumTemperature: Double?
+    var minimumTemperature: Double?
+    /// Non-zero means the gauge has latched a permanent fault.
+    var permanentFailureStatus: Int?
+    /// Times a cell has been seen to disconnect. Any of these is a hardware
+    /// fault, not wear.
+    var cellDisconnectCount: Int?
+
+    /// Capacity now against capacity when new.
+    ///
+    /// A fresh pack reads slightly *above* its design figure — this Mac's own
+    /// battery reports 4746 mAh against a 4629 mAh design — because the design
+    /// number is a floor the cells are built to clear, not an average. The
+    /// true ratio is kept here and the UI is what clamps the display to 100%,
+    /// so nothing is thrown away before anyone has looked at it.
+    var capacityPercent: Double? {
+        guard let design = designCapacity, design > 0, let now = nominalChargeCapacity
+        else { return nil }
+        return now / design * 100
+    }
+
+    /// How much of the rated cycle life has been used.
+    var cyclePercent: Double? {
+        guard let rated = designCycleCount, rated > 0, let used = cycleCount else { return nil }
+        return Double(used) / Double(rated) * 100
+    }
+
+    /// The one condition worth interrupting someone over. Wear is not a fault
+    /// and does not qualify: a pack at 79% is working exactly as designed.
+    var needsService: Bool {
+        (permanentFailureStatus ?? 0) != 0 || (cellDisconnectCount ?? 0) > 0
+    }
+
+    var hasAnything: Bool {
+        cycleCount != nil || capacityPercent != nil || temperature != nil
+    }
+}
+
+/// Why charging is not happening, or not happening at full speed.
+///
+/// The charger publishes a `NotChargingReason` bitmask which is deliberately
+/// **not** decoded into words here. Its bit meanings are not documented
+/// anywhere checkable, and the only value this Mac has been observed to report
+/// is 128 while running on battery with nothing attached — one data point is
+/// not a table. Inventing labels for the rest would be exactly the guessing
+/// this app refuses to do elsewhere, so the raw value is carried for the
+/// diagnostics pane and nothing is claimed about it.
+///
+/// Observed values, for whenever there are enough of them to be a table:
+/// `128` on battery with nothing attached, and `0x01000000` at an 80% hold
+/// with a charger attached and `ChargingCurrent` at zero — `BatteryData`'s
+/// own `Flags` reads `0x01000001` at the same moment, so bit 24 means
+/// something to both. Two readings are still not a table.
+///
+/// The fields that *are* stated in words are the ones whose names say what
+/// they hold: a thermally-limited duration, an inhibit reason, and the
+/// charging circuit's current setpoint. Note whose setpoint that is — it
+/// comes from `ChargerData` inside `AppleSmartBattery`, so it belongs to this
+/// Mac's own charging IC, not to the brick on the other end of the cable.
+struct ChargingHold: Hashable {
+    /// Milliamps the charger intends to push. Zero means it has stopped.
+    var chargingCurrentMA: Double?
+    var chargingVoltageMV: Double?
+    var notChargingReason: Int?
+    var slowChargingReason: Int?
+    var inhibitReason: Int?
+    /// Seconds this charge has spent held back by heat.
+    var secondsThermallyLimited: Int?
+
+    var isThermallyLimited: Bool { (secondsThermallyLimited ?? 0) > 0 }
+    var isSlowed: Bool { (slowChargingReason ?? 0) != 0 }
+    var isInhibited: Bool { (inhibitReason ?? 0) != 0 }
+
+    /// What can be said out loud, given an adapter is attached and the battery
+    /// is not filling. Nil when there is nothing defensible to say.
+    func summary(externalConnected: Bool, isCharging: Bool) -> String? {
+        guard externalConnected, !isCharging else { return nil }
+        if isInhibited { return "The charger is holding charge back." }
+        if isThermallyLimited { return "Charging is being limited by temperature." }
+        // A zero setpoint deliberately says nothing.
+        //
+        // It used to read "The charger has set its charge current to zero",
+        // which was wrong twice over: the setpoint comes from `ChargerData`
+        // inside `AppleSmartBattery`, so it belongs to this Mac's own charging
+        // IC and not to the brick, and a setpoint of zero is not evidence of a
+        // decision by anything that can be named. Rewording it to attribute
+        // nothing left a sentence that only restated the "holding" already
+        // beside the percentage, on the commonest reading there is: a pack
+        // sitting at a charge limit, doing exactly what it was told to.
+        //
+        // Naming the real cause needs a flag macOS does not publish. Searched
+        // AppleSmartBattery's whole property set, IOPMPowerSource, BatteryData,
+        // com.apple.PowerManagement and com.apple.smartcharging: there is no
+        // charge-limit key anywhere readable. The one candidate is bit 24 of
+        // `notChargingReason`, and one observation of it is not a decode.
+        return nil
+    }
+}
+
+/// A single reading of what power is flowing right now.
+struct PowerSnapshot {
+    var externalConnected = false
+    var isCharging = false
+
+    /// Live power arriving from the adapter.
+    var inputWatts: Double?
+    var inputVolts: Double?
+    var inputAmps: Double?
+
+    /// What the whole machine is consuming.
+    var systemLoadWatts: Double?
+    /// Measured draw of everything on the USB-C ports, included in the load above.
+    var accessoryWatts: Double?
+    /// Which port the charger is attached to, e.g. "MagSafe 3".
+    var sourcePortName: String?
+
+    /// The machine's own consumption, once accessories are taken out.
+    var macOnlyWatts: Double? {
+        guard let load = systemLoadWatts else { return nil }
+        return max(load - (accessoryWatts ?? 0), 0)
+    }
+
+    /// Positive while charging, negative while the battery is being drained.
+    var batteryWatts: Double?
+    var batteryPercent: Int?
+    /// The pack's own terminals, live. The IORegistry copy of these sits still
+    /// for 10-30 s at a stretch; these come from the SMC and move every sample.
+    var batteryVolts: Double?
+    var batteryAmps: Double?
+    /// The gauge's own runtime estimate, in minutes, and only ever the one that
+    /// applies: a discharging pack has no time-to-full and says so with 0xFFFF,
+    /// which is dropped rather than shown as a 45-day charge.
+    var minutesToEmpty: Int?
+    var minutesToFull: Int?
+
+    /// What the pack reports about its own condition.
+    var health = BatteryHealth()
+    /// Why the battery is not filling, when a charger is attached and it isn't.
+    var chargingHold = ChargingHold()
+
+    /// What the adapter is offering at the voltage this Mac chose, as opposed
+    /// to what it is delivering. Not its rating, though it used to be printed
+    /// as one: `AdapterDetails.Watts` is the chosen offer multiplied out (96 W
+    /// on the dock is 20 V x 4.8 A), and a charger facing a cable it cannot
+    /// confirm for 5 A offers 3 A at most. A 100 W charger on a plain 60 W
+    /// cable publishes 60 here, and was being called a 60 W charger.
+    var adapterWatts: Double?
+    var adapterName: String?
+    /// The adapter as written on the adapter, set only when it publishes a real
+    /// one. `adapterName` falls back to a category where this is nil.
+    var adapterModelName: String?
+    /// The adapter's own account of who built it. Apple's own bricks report
+    /// "Apple Inc." here; third-party PD chargers report their own name, or
+    /// nothing at all.
+    var adapterManufacturer: String?
+    var adapterSerial: String?
+    var adapterFirmware: String?
+
+    /// Whether the thing charging this Mac is Apple's own.
+    var isAppleAdapter: Bool {
+        adapterManufacturer?.localizedCaseInsensitiveContains("apple") ?? false
+    }
+    var profiles: [PDProfile] = []
+    var negotiatedProfile: Int?
+    /// The charger's complete offer, PPS and AVS ranges included, where the
+    /// port controller's raw copy of it can be tied to the charger attached
+    /// now. Nil far more often than not, and that is the answer.
+    var sourceCapabilities: SourceCapabilities?
+
+    /// The voltage the PD contract actually settled on, when there is one.
+    ///
+    /// This is a statement about the link rather than a measurement of it,
+    /// which is what makes it usable while the measured copy is stale: the
+    /// contract does not drift between samples the way the rails do.
+    var negotiatedVolts: Double? {
+        guard let index = negotiatedProfile else { return nil }
+        return profiles.first { $0.id == index }?.volts
+    }
+
+    var hasAdapter: Bool { externalConnected && adapterWatts != nil }
+
+    /// Signed battery flow: negative is leaving the battery, positive is going in.
+    var batterySigned: String? {
+        guard let watts = batteryWatts else { return nil }
+        if abs(watts) < 0.05 { return "0.00 W" }
+        return String(format: "%+.2f W", watts)
+    }
+
+    /// Which way charge is actually moving through the cell.
+    enum CellFlow: Equatable { case charging, draining, resting }
+
+    /// Below this the cell is called resting. Applied to the terminals on a
+    /// charger and to the computed flow off one, the same figure it always was.
+    static let restingWatts = 0.05
+
+    /// On a charger, the pack's own terminals decide.
+    ///
+    /// Which is usually what `batteryWatts` already is there — see
+    /// `PowerMonitor.batteryWatts(computed:externalConnected:terminals:)` for
+    /// the SMC lag that made the computed flow flip the panel between "holding"
+    /// and "draining" every second at a charge limit, and for the measurement.
+    /// It is asked again here because the terminals may only have answered
+    /// from the registry, whose copy is stale but whose sign is still right:
+    /// `InstantAmperage` read 0 in 20 of 20 samples at that hold.
+    ///
+    /// Off the charger nothing changes: there is no input to lag behind, the
+    /// flow is minus the load, and it has always been read that way.
+    var cellFlow: CellFlow? {
+        if externalConnected, let volts = batteryVolts, let amps = batteryAmps {
+            return Self.cellFlow(watts: volts * amps / 1_000_000)
+        }
+        return batteryWatts.map(Self.cellFlow(watts:))
+    }
+
+    private static func cellFlow(watts: Double) -> CellFlow {
+        if abs(watts) < restingWatts { return .resting }
+        return watts > 0 ? .charging : .draining
+    }
+
+    var batteryState: String? {
+        guard batteryWatts != nil, let flow = cellFlow else { return nil }
+        switch flow {
+        case .resting: return externalConnected ? "holding" : "idle"
+        case .charging: return "charging"
+        case .draining: return "draining"
+        }
+    }
+
+    /// "-10.27 W · draining · 100%"
+    var batteryDescription: String? {
+        guard let signed = batterySigned, let state = batteryState else { return nil }
+        return [signed, state, batteryPercent.map { "\($0)%" }]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    /// Where the power is going, as segments of one bar.
+    ///
+    /// This replaced a stack of "System draw / accessories / Mac itself /
+    /// Battery" rows that made you do the arithmetic yourself to see whether
+    /// the charger had anything left to give.
+    var allocation: PowerAllocation? {
+        guard let load = systemLoadWatts, load > 0 else { return nil }
+        let accessories = accessoryWatts ?? 0
+        var segments: [PowerAllocation.Segment] = [
+            .init(id: "mac", label: "Mac", watts: max(load - accessories, 0))
+        ]
+        if accessories > 0.05 {
+            segments.append(.init(id: "accessories", label: "Accessories", watts: accessories))
+        }
+        // Charge going into the cell is the third place the wall's power lands.
+        // Only when the terminals say it is: held at a limit, the computed
+        // flow alone put a battery segment in and out of the bar every second.
+        if externalConnected, cellFlow == .charging, let battery = batteryWatts, battery > 0.05 {
+            segments.append(.init(id: "battery", label: "Battery", watts: battery))
+        }
+
+        let used = segments.reduce(0) { $0 + $1.watts }
+        // On battery there is no ceiling to show headroom against, so the bar
+        // just splits the draw itself.
+        let capacity = externalConnected ? max(adapterWatts ?? used, used) : used
+        return PowerAllocation(segments: segments, capacity: max(capacity, 0.1))
+    }
+}
+
+/// The split of the power currently flowing, sized against what the charger
+/// can supply.
+struct PowerAllocation {
+    struct Segment: Identifiable {
+        let id: String
+        let label: String
+        let watts: Double
+    }
+
+    var segments: [Segment]
+    /// Full width of the bar: the charger's rating when plugged in, otherwise
+    /// just the total being drawn.
+    var capacity: Double
+
+    var used: Double { segments.reduce(0) { $0 + $1.watts } }
+    var headroom: Double? { capacity - used > 0.5 ? capacity - used : nil }
+
+    /// Whether the bar is worth drawing at all.
+    ///
+    /// On battery there is no ceiling to measure against, so a lone segment
+    /// fills the whole width and reads as "maxed out" while actually saying
+    /// nothing — and its legend just repeats the headline.
+    var isInformative: Bool { segments.count > 1 || headroom != nil }
+}
+
+/// Reads Apple's SMC power telemetry out of the IORegistry.
+///
+/// `AppleSmartBattery` publishes `PowerTelemetryData`, which is where the live
+/// numbers live — the adapter's `Watts` field is only its advertised rating.
+enum PowerMonitor {
+
+    static func read() -> PowerSnapshot {
+        var snapshot = PowerSnapshot()
+
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault, IOServiceMatching("AppleSmartBattery")
+        )
+        guard service != 0 else { return snapshot }
+        defer { IOObjectRelease(service) }
+
+        guard let top = registryProperties(of: service) else { return snapshot }
+        let properties = batteryProperties(
+            top: top,
+            packs: childProperties(of: service, conformingTo: "AppleSmartBatteryPack"),
+            chargers: childProperties(of: service, conformingTo: "AppleChargerData")
+        )
+
+        snapshot.externalConnected = properties["ExternalConnected"] as? Bool ?? false
+        snapshot.isCharging = properties["IsCharging"] as? Bool ?? false
+        snapshot.batteryPercent = number(properties["CurrentCapacity"]).map { Int($0) }
+
+        // Telemetry arrives in milliwatts / millivolts / milliamps. It only
+        // refreshes every 10-30 s, so it is a fallback for the SMC values below.
+        if let telemetry = properties["PowerTelemetryData"] as? [String: Any] {
+            snapshot.inputWatts = number(telemetry["SystemPowerIn"]).map { $0 / 1000 }
+            snapshot.inputVolts = number(telemetry["SystemVoltageIn"]).map { $0 / 1000 }
+            snapshot.inputAmps = number(telemetry["SystemCurrentIn"]).map { $0 / 1000 }
+            snapshot.systemLoadWatts = number(telemetry["SystemLoad"]).map { $0 / 1000 }
+            snapshot.batteryWatts = number(telemetry["BatteryPower"]).map { $0 / 1000 }
+        }
+
+        // The SMC updates about once a second; prefer it wherever it answers.
+        let smc = SMCMonitor.read()
+        if let watts = smc.systemWatts { snapshot.systemLoadWatts = watts }
+        if let watts = smc.adapterWatts { snapshot.inputWatts = watts }
+        if let flow = smc.batteryFlow { snapshot.batteryWatts = flow }
+        // Only an input key that answered gets to overrule the registry on
+        // whether a charger is attached. Gated on the load key alone, a Mac
+        // that publishes PSTR but not PDTR read as having no adapter at all —
+        // "on battery", no charger card — on every brick plugged into it.
+        if smc.systemWatts != nil, smc.adapterWatts != nil {
+            snapshot.externalConnected = smc.hasAdapter
+            // Keep volts/amps consistent with the fresher wattage.
+            if let watts = smc.adapterWatts, let volts = snapshot.inputVolts, volts > 1 {
+                snapshot.inputAmps = watts / volts
+            } else if !smc.hasAdapter {
+                snapshot.inputVolts = 0
+                snapshot.inputAmps = 0
+            }
+        }
+
+        // The pack's own terminals. The SMC answers first for the same reason
+        // it does for the wattage above — the registry copy is 10-30 s stale,
+        // and watched over three seconds with nothing attached it held -401 mA
+        // while the SMC reported -410, -554 and -455 in turn.
+        let pack = SMCMonitor.battery()
+        snapshot.batteryVolts = pack.volts ?? number(properties["Voltage"])
+        snapshot.batteryAmps = pack.amps
+            ?? number(properties["InstantAmperage"])
+            ?? number(properties["Amperage"])
+        snapshot.minutesToEmpty = pack.minutesToEmpty
+        snapshot.minutesToFull = pack.minutesToFull
+        snapshot.batteryWatts = batteryWatts(
+            computed: snapshot.batteryWatts,
+            externalConnected: snapshot.externalConnected,
+            terminals: pack
+        )
+
+        // Fall back to battery voltage x amperage if telemetry is unavailable.
+        if snapshot.batteryWatts == nil,
+           let mV = snapshot.batteryVolts, let mA = snapshot.batteryAmps {
+            snapshot.batteryWatts = mV * mA / 1_000_000
+        }
+
+        snapshot.health = health(from: properties)
+        snapshot.chargingHold = chargingHold(from: properties)
+
+        if let adapter = properties["AdapterDetails"] as? [String: Any] {
+            let watts = number(adapter["Watts"])
+            snapshot.adapterWatts = (watts ?? 0) > 0 ? watts : nil
+            // "Name" is the brick as it is written on the brick — "35W USB-C
+            // Power Adapter". "Description" is the category it falls into, and
+            // is usually the far less useful "pd charger".
+            let name = (adapter["Name"] as? String)?
+                .trimmingCharacters(in: .whitespaces).nilIfEmpty
+            // Only a real name is fit to title a card. Description is a
+            // category — "pd charger", or "usb host" for a monitor feeding the
+            // Mac over Type-C — and a card headed "Usb host" helps nobody.
+            snapshot.adapterModelName = name
+            if let name {
+                snapshot.adapterName = name
+            } else if let description = adapter["Description"] as? String, !description.isEmpty {
+                snapshot.adapterName = description.capitalizedFirst
+            }
+            snapshot.adapterManufacturer = (adapter["Manufacturer"] as? String)?
+                .trimmingCharacters(in: .whitespaces).nilIfEmpty
+            snapshot.adapterSerial = (adapter["SerialString"] as? String)?
+                .trimmingCharacters(in: .whitespaces).nilIfEmpty
+            snapshot.adapterFirmware = (adapter["FwVersion"] as? String)?
+                .trimmingCharacters(in: .whitespaces).nilIfEmpty
+            snapshot.negotiatedProfile = number(adapter["UsbHvcHvcIndex"]).map { Int($0) }
+
+            if let menu = adapter["UsbHvcMenu"] as? [[String: Any]] {
+                snapshot.profiles = menu.compactMap { entry in
+                    guard let index = number(entry["Index"]),
+                          let mV = number(entry["MaxVoltage"]),
+                          let mA = number(entry["MaxCurrent"])
+                    else { return nil }
+                    return PDProfile(id: Int(index), volts: mV / 1000, amps: mA / 1000)
+                }
+                .sorted { $0.volts < $1.volts }
+            }
+        }
+        snapshot.sourceCapabilities = sourceCapabilities(from: properties)
+
+        // The measured input rail is part of the same 10-30 s stale copy as the
+        // rest of PowerTelemetryData, and in the seconds after a charger is
+        // plugged in it is still describing the unplugged state — zero volts,
+        // zero amps — while the SMC has already seen the power arrive. That put
+        // "Input: 9.80 W" directly above "Input rail: 0.00 V / 0.000 A" on the
+        // panel, at the one moment somebody is definitely looking at it.
+        //
+        // The correction above only ever recomputed the current, and only where
+        // there was already a plausible voltage to divide by, so a stale zero
+        // fell through both of its branches untouched.
+        //
+        // The negotiated contract answers it. It is the voltage the link
+        // settled on, it is published as soon as the contract exists, and it
+        // does not drift between samples. Applied only to replace a reading
+        // that is missing or implausible, never to overwrite a real one: a
+        // measured rail sagging under load is a fact worth seeing, and the
+        // contract voltage would quietly paper over exactly that.
+        snapshot = correctStaleInput(snapshot)
+
+        return snapshot
+    }
+
+    /// The battery's flow: on a charger, what the pack's terminals measure;
+    /// off one, the input less the load, as it always was.
+    ///
+    /// Input less load was the figure everywhere until 16 October, and on a
+    /// charger it is wrong in a way no smoothing fixes: the SMC publishes PSTR
+    /// one sample behind PDTR. Watched with `--watch` at an 80% charge limit,
+    /// 109 of 109 lines had this second's load equal to the previous second's
+    /// input to the hundredth of a watt, so with the cell held the "flow" was
+    /// the change in input since the second before — across 338 samples a
+    /// standard deviation of 1.72 W and swings of ±12.6 W when the load
+    /// stepped, while B0AC read exactly 0 mA in all 229 that carried it. The
+    /// raw captures in `probes/` say the same at a single instant: five taken
+    /// at a hold have the difference anywhere from -5.9 to +6.4 W and every
+    /// one has the terminals at 0 mA.
+    ///
+    /// The lag is also what an older note here put down to the two being
+    /// separate samples: during a compile, 46.51 W arriving against a 32.77 W
+    /// load implied 13.74 W into the cell while the terminals read 30.9 W. On
+    /// a quiet machine the two tie out — 45.9 W in less 6.84 W consumed is
+    /// 39.06 W, against 12.370 V x 3.183 A = 39.4 W at the pack — and on the
+    /// BMW's rear port, a steady 15 W supply, the capture has 4.62 W computed
+    /// against 4.11 W at the terminals — a half watt that is presumably the
+    /// charger's own conversion loss, and is not charge the cell receives.
+    /// Those two are the only charging figures there are: charging has not
+    /// been watched second by second with this in place, because the Mac it
+    /// was written on sat at its charge limit throughout.
+    ///
+    /// Only the SMC's own terminal reading counts. The registry's copy of
+    /// voltage and current is 10–30 s stale, which is a lag of its own. Off a
+    /// charger nothing changes: the input is zero, there is nothing for the
+    /// load to lag behind, and the flow is minus the load.
+    static func batteryWatts(
+        computed: Double?, externalConnected: Bool, terminals: SMCMonitor.BatteryReading
+    ) -> Double? {
+        guard externalConnected, let watts = terminals.watts else { return computed }
+        return watts
+    }
+
+    /// Replaces an input rail that has not caught up yet with the contract the
+    /// link settled on. Pure, so `--selftest` drives exactly this. See the call
+    /// site for why the measured copy cannot be trusted in that window.
+    static func correctStaleInput(_ snapshot: PowerSnapshot) -> PowerSnapshot {
+        guard let watts = snapshot.inputWatts, watts > 0.05,
+              (snapshot.inputVolts ?? 0) <= 1,
+              let contract = snapshot.negotiatedVolts, contract > 1
+        else { return snapshot }
+        var corrected = snapshot
+        corrected.inputVolts = contract
+        corrected.inputAmps = watts / contract
+        return corrected
+    }
+
+    /// The keys `health(from:)` reads flat, which macOS 27 publishes only
+    /// inside a `BatteryData` dictionary.
+    private static let liftedBatteryKeys = [
+        "DesignCapacity", "NominalChargeCapacity", "AppleRawMaxCapacity",
+        "Temperature", "PermanentFailureStatus", "BatteryCellDisconnectCount",
+    ]
+
+    /// `AppleSmartBattery`'s properties in the shape the parsers below were
+    /// written against, whichever layout the running macOS publishes.
+    ///
+    /// Up to macOS 26 everything sat on the one node. macOS 27 splits it into
+    /// a tree — `AppleSmartBatteryPack`, then `AppleSmartBatteryBank` and
+    /// `AppleSmartBatteryCell` under it, and `AppleChargerData` beside it —
+    /// and leaves the top node with the charge percentage, cycle count and
+    /// telemetry but nothing else this reads. Capacity survives only inside the
+    /// top node's `BatteryData`; temperature, the lifetime extremes and both
+    /// fault counters moved to the pack's; the charge setpoint to the charger's.
+    /// Nothing failed. The panel simply stopped showing condition, and the
+    /// service warning stopped being able to fire, which is the one reading
+    /// here whose silence reads as good news.
+    ///
+    /// Folded rather than taught to each parser, so the replayed captures from
+    /// both layouts go through the same code. The top node always wins: on a
+    /// macOS that still publishes it flat nothing here changes, and a child
+    /// only fills a key the top left empty.
+    ///
+    /// Only where there is exactly one pack and one charger. `BatteryPackCount`
+    /// and `ChargerCount` exist because more than one is possible, and with two
+    /// there is no way to tell which one the panel's single condition line
+    /// ought to describe, so neither is used.
+    static func batteryProperties(
+        top: [String: Any], packs: [[String: Any]], chargers: [[String: Any]]
+    ) -> [String: Any] {
+        var properties = top
+        if packs.count == 1, let pack = packs[0]["BatteryData"] as? [String: Any] {
+            var data = top["BatteryData"] as? [String: Any] ?? [:]
+            data.merge(pack) { current, _ in current }
+            properties["BatteryData"] = data
+        }
+        if let data = properties["BatteryData"] as? [String: Any] {
+            for key in liftedBatteryKeys where properties[key] == nil {
+                properties[key] = data[key]
+            }
+        }
+        if chargers.count == 1, let charger = chargers[0]["ChargerData"] as? [String: Any] {
+            var data = top["ChargerData"] as? [String: Any] ?? [:]
+            data.merge(charger) { current, _ in current }
+            properties["ChargerData"] = data
+        }
+        return properties
+    }
+
+    /// Reads the pack's condition out of one `AppleSmartBattery` property
+    /// dictionary, as `batteryProperties` hands it over.
+    ///
+    /// Split from `read()` so recorded captures can be replayed through it —
+    /// see `--selftest`. Capacity and cycle figures sit at the top level;
+    /// the temperature extremes are inside the gauge's own `BatteryData`.
+    static func health(from properties: [String: Any]) -> BatteryHealth {
+        var health = BatteryHealth()
+        health.cycleCount = number(properties["CycleCount"]).map { Int($0) }
+        health.designCycleCount = number(properties["DesignCycleCount9C"]).map { Int($0) }
+        health.designCapacity = number(properties["DesignCapacity"])
+        health.nominalChargeCapacity = number(properties["NominalChargeCapacity"])
+            ?? number(properties["AppleRawMaxCapacity"])
+        // Tenths of a degree twice over: the property is in hundredths.
+        health.temperature = number(properties["Temperature"]).map { $0 / 100 }
+        health.permanentFailureStatus = number(properties["PermanentFailureStatus"]).map { Int($0) }
+        health.cellDisconnectCount = number(properties["BatteryCellDisconnectCount"]).map { Int($0) }
+
+        if let data = properties["BatteryData"] as? [String: Any] {
+            // These sit in LifetimeData, not beside it. Read from BatteryData
+            // directly they were never once present, so the warmest and coldest
+            // the pack has ever been have been blank for the whole life of the
+            // app rather than merely unavailable.
+            if let lifetime = data["LifetimeData"] as? [String: Any] {
+                let range = lifetimeTemperatureRange(
+                    minimum: number(lifetime["MinimumTemperature"]),
+                    maximum: number(lifetime["MaximumTemperature"]),
+                    current: health.temperature
+                )
+                health.minimumTemperature = range?.minimum
+                health.maximumTemperature = range?.maximum
+            }
+            if health.cycleCount == nil {
+                health.cycleCount = number(data["CycleCount"]).map { Int($0) }
+            }
+            if health.designCapacity == nil {
+                health.designCapacity = number(data["DesignCapacity"])
+            }
+        }
+        return health
+    }
+
+    /// The pack's lifetime temperature extremes in whole degrees, or nothing
+    /// when the scale cannot be settled.
+    ///
+    /// `LifetimeData` carries no unit and no version, and the scale is not the
+    /// same on every machine: some packs report these in whole degrees and some
+    /// in tenths. Printing them raw is how another tool came to tell somebody
+    /// their battery had reached 454 °C. The fuel gauge part number predicts it
+    /// well but not reliably, so it is settled from the numbers instead:
+    ///
+    /// 1. A lifetime *maximum* above 80 can only be tenths. No pack in service
+    ///    reaches 80 °C, and none has a lifetime maximum as low as 8 °C, so the
+    ///    threshold sits in a gap rather than on a boundary.
+    /// 2. `Temperature`, whose scale we do know, has to fall inside a range the
+    ///    pack has actually lived through.
+    ///
+    /// When the two disagree, nothing is reported. A temperature that might be
+    /// out by a factor of ten is worse than a blank line. The minimum is
+    /// deliberately not consulted: a reading like -123 is a believable -12.3 °C
+    /// in tenths and nonsense in whole degrees, so it cannot discriminate, and
+    /// the pair is scaled together off the maximum.
+    ///
+    /// This Mac reports 1 and 38 against a current reading of 30.2 °C: whole
+    /// degrees by both tests.
+    static func lifetimeTemperatureRange(
+        minimum: Double?, maximum: Double?, current: Double?
+    ) -> (minimum: Double, maximum: Double)? {
+        guard let minimum, let maximum, minimum <= maximum else { return nil }
+        // An uninitialised blob reads as zero either way round, so there is
+        // nothing to choose between and nothing worth showing.
+        guard !(minimum == 0 && maximum == 0) else { return nil }
+
+        let whole = (minimum: minimum, maximum: maximum)
+        let tenths = (minimum: minimum / 10, maximum: maximum / 10)
+        /// A range no battery could have lived through is not a resolved scale,
+        /// whichever way it is read.
+        func plausible(_ range: (minimum: Double, maximum: Double)) -> Bool {
+            range.minimum >= -40 && range.maximum <= 100
+        }
+        let byMagnitude = maximum > 80 ? tenths : whole
+
+        // With no reading to check against, magnitude stands alone rather than
+        // withholding the answer from the machines least able to spare it.
+        guard let current else { return plausible(byMagnitude) ? byMagnitude : nil }
+
+        let fits = [whole, tenths].filter {
+            plausible($0) && $0.minimum - 1 <= current && current <= $0.maximum + 1
+        }
+        // Containment settles what magnitude cannot, but it does not get to
+        // overrule it: two signals pointing opposite ways is not a resolved
+        // scale, and neither is both readings looking reasonable at once.
+        guard fits.count == 1, fits[0] == byMagnitude else { return nil }
+        return fits[0]
+    }
+
+    /// Reads the charger's own account of why it is not charging.
+    ///
+    /// Split from `read()` for the same reason as `health(from:)`.
+    static func chargingHold(from properties: [String: Any]) -> ChargingHold {
+        guard let charger = properties["ChargerData"] as? [String: Any] else { return ChargingHold() }
+        var hold = ChargingHold()
+        hold.chargingCurrentMA = number(charger["ChargingCurrent"])
+        hold.chargingVoltageMV = number(charger["ChargingVoltage"])
+        hold.notChargingReason = number(charger["NotChargingReason"]).map { Int($0) }
+        hold.slowChargingReason = number(charger["SlowChargingReason"]).map { Int($0) }
+        hold.inhibitReason = number(charger["ChargerInhibitReason"]).map { Int($0) }
+        hold.secondsThermallyLimited = number(charger["TimeChargingThermallyLimited"]).map { Int($0) }
+        return hold
+    }
+
+    private static func registryProperties(of entry: io_registry_entry_t) -> [String: Any]? {
+        var unmanaged: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(entry, &unmanaged, kCFAllocatorDefault, 0) == KERN_SUCCESS
+        else { return nil }
+        return unmanaged?.takeRetainedValue() as? [String: Any]
+    }
+
+    /// Direct children only: the pack and the charger both hang straight off
+    /// `AppleSmartBattery`, and the banks and cells below the pack carry
+    /// nothing this reads.
+    private static func childProperties(
+        of service: io_service_t, conformingTo className: String
+    ) -> [[String: Any]] {
+        var iterator: io_iterator_t = 0
+        guard IORegistryEntryGetChildIterator(service, kIOServicePlane, &iterator) == KERN_SUCCESS
+        else { return [] }
+        defer { IOObjectRelease(iterator) }
+        var found: [[String: Any]] = []
+        var child = IOIteratorNext(iterator)
+        while child != 0 {
+            if IOObjectConformsTo(child, className) != 0, let properties = registryProperties(of: child) {
+                found.append(properties)
+            }
+            IOObjectRelease(child)
+            child = IOIteratorNext(iterator)
+        }
+        return found
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let string = value as? String { return Double(string) }
+        return nil
+    }
+}
+
+private extension String {
+    /// "pd charger" -> "PD charger"
+    var capitalizedFirst: String {
+        if lowercased().hasPrefix("pd ") { return "PD " + dropFirst(3) }
+        return prefix(1).uppercased() + dropFirst()
+    }
+}

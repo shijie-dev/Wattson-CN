@@ -1,0 +1,2584 @@
+import Foundation
+
+/// Replays recorded hardware captures through the readers' parse functions.
+///
+/// This exists because the readers can otherwise only be exercised by plugging
+/// something in. Every reader here reads a private, undocumented IORegistry
+/// shape, and a shape that is read wrongly returns nothing at all rather than
+/// returning something visibly broken — which is indistinguishable from the
+/// platform withholding the data. The e-marker reader was wrong for the whole
+/// life of the app for exactly that reason: it read `VDOs` from the top level
+/// of a node that publishes them one level down, and every Mac agreed by
+/// staying silent.
+///
+/// The fixtures below are lifted verbatim from captures in `probes/`, reduced
+/// to the keys the parse functions read and stripped of serial numbers. They
+/// are checked in deliberately: the hardware they came from is not always to
+/// hand, and the point is to be able to catch a regression without it.
+///
+/// Most checks are self-validating rather than asserting a remembered number.
+/// A Discover Identity node publishes its vendor ID twice — once as a plain
+/// integer, and once inside the low 16 bits of the ID Header VDO — so decoding
+/// the VDOs correctly means the two agree, and no byte order but the right one
+/// makes that happen five times over.
+enum SelfTest {
+
+    static func run() -> Int32 {
+        var checks: [Check] = []
+        checks += identityChecks()
+        checks += batteryChecks()
+        checks += batteryTreeChecks()
+        checks += portStatsChecks()
+        checks += thunderboltChecks()
+        checks += liquidChecks()
+        checks += phyChecks()
+        checks += displayChecks()
+        checks += smcChecks()
+        checks += connectionStateChecks()
+        checks += billboardChecks()
+        checks += displayLinkChecks()
+        checks += emarkerSilenceChecks()
+        checks += tunnelChecks()
+        checks += staleInputChecks()
+        checks += cellFlowChecks()
+        checks += linkBottleneckChecks()
+        checks += cableNoteChecks()
+        checks += headlineChecks()
+        checks += packTemperatureChecks()
+        checks += sourceCapabilityChecks()
+        checks += cableLimitChecks()
+        checks += menuBarWattsChecks()
+
+        let failures = checks.filter { !$0.passed }
+        for check in checks {
+            print("\(check.passed ? "  ok  " : "FAILED") \(check.name)")
+            // Detail is what a failure needs to be actionable without a
+            // debugger; on a passing check it is just noise.
+            if !check.passed, let detail = check.detail { print("         \(detail)") }
+        }
+        print("")
+        print("\(checks.count - failures.count)/\(checks.count) checks passed.")
+        return failures.isEmpty ? 0 : 1
+    }
+
+    struct Check {
+        let name: String
+        let passed: Bool
+        var detail: String?
+    }
+
+    // MARK: - SMC decoding and the D-channel join
+
+    /// Four SMC keys read at the same instant as the IORegistry values they
+    /// have to equal, captured on this Mac.
+    ///
+    /// This is the self-validating shape the identity fixtures use, applied to
+    /// a question that is otherwise a matter of opinion: the raw bytes are here
+    /// beside a figure published independently elsewhere in the system, and no
+    /// byte order but the right one makes all four agree. Read the other way
+    /// round the cycle count is 3328 and the design capacity 5394, which is
+    /// what every capture said before this.
+    private static let smcIntegerCapture: [(key: String, type: String, bytes: [UInt8], registry: Int)] = [
+        // AppleSmartBattery.CycleCount
+        (key: "B0CT", type: "ui16", bytes: [0x0d, 0x00], registry: 13),
+        // AppleSmartBattery.DesignCapacity
+        (key: "B0DC", type: "ui16", bytes: [0x15, 0x12], registry: 4629),
+        // AppleSmartBattery.BatteryData.Qmax[0]
+        (key: "BQX1", type: "ui16", bytes: [0x25, 0x13], registry: 4901),
+        // AppleSmartBattery.BatteryData.DataFlashWriteCount
+        (key: "BFWC", type: "ui16", bytes: [0x8b, 0x12], registry: 4747),
+    ]
+
+    /// The negotiated-contract keys, read while a dock was feeding this Mac.
+    /// The `contract` column is what the port reported through the PD node, not
+    /// a number remembered from the SMC.
+    private static let smcContractCapture: [(key: String, type: String, bytes: [UInt8], contract: Int)] = [
+        (key: "D2MV", type: "ui16", bytes: [0x4e, 0x20], contract: 20000),      // 20 V
+        (key: "D2MI", type: "ui16", bytes: [0x12, 0xc0], contract: 4800),       // 4.80 A
+        (key: "D2MP", type: "ui32", bytes: [0x00, 0x01, 0x77, 0x00], contract: 96000), // 96 W
+    ]
+
+    private static func smcChecks() -> [Check] {
+        var checks: [Check] = []
+        for capture in smcIntegerCapture {
+            let decoded = SMCMonitor.decode(bytes: capture.bytes, type: capture.type, key: capture.key)
+            checks.append(Check(
+                name: "smc: \(capture.key) agrees with the value the registry publishes",
+                passed: decoded == String(capture.registry),
+                detail: "got \(decoded ?? "nil"), registry says \(capture.registry)"))
+        }
+
+        // `#KEY` is the controller's own key count. Read like the rest it comes
+        // out as 1376256000.
+        checks.append(Check(
+            name: "smc: #KEY is still read big-endian",
+            passed: SMCMonitor.decode(bytes: [0x00, 0x00, 0x08, 0x52], type: "ui32", key: "#KEY") == "2130",
+            detail: "got \(SMCMonitor.decode(bytes: [0x00, 0x00, 0x08, 0x52], type: "ui32", key: "#KEY") ?? "nil")"))
+
+        // The contract keys, captured against a dock feeding this Mac while the
+        // port independently reported 20 V, 4.80 A and 96 W. Same self-
+        // validating shape as the battery keys above: the bytes sit beside a
+        // figure the hardware published by another route entirely, and only one
+        // byte order makes all three agree.
+        for capture in smcContractCapture {
+            let decoded = SMCMonitor.decode(bytes: capture.bytes, type: capture.type, key: capture.key)
+            checks.append(Check(
+                name: "smc: \(capture.key) agrees with the contract the port reported",
+                passed: decoded == String(capture.contract),
+                detail: "got \(decoded ?? "nil"), the port said \(capture.contract)"))
+        }
+        // Not a rule that could be inferred from a key name, so the list has to
+        // stay a list — and must not swallow its neighbours.
+        checks.append(Check(name: "smc: the big-endian list does not spread to nearby keys",
+                            passed: !SMCMonitor.isBigEndian(key: "D2JV")
+                                && !SMCMonitor.isBigEndian(key: "D2UI")
+                                && !SMCMonitor.isBigEndian(key: "B0DC")
+                                && SMCMonitor.isBigEndian(key: "D2MV")))
+
+        // A rail is claimed by the controller that names it, not by the port
+        // whose number happens to match. The numbering here is deliberately
+        // crossed: it is the case the UUID exists to survive.
+        let channels = [
+            SMCMonitor.PortChannel(index: 1, controllerUUID: "aaaa0000000000000000000000000001",
+                                   sourceDescription: "pd charger",
+                                   power: SMCMonitor.PortPower(volts: 20, amps: 2.25)),
+            SMCMonitor.PortChannel(index: 2, controllerUUID: "aaaa0000000000000000000000000002",
+                                   sourceDescription: nil, power: nil),
+        ]
+        var far = PortInfo(name: "USB-C", kind: .usbC, number: 4, isConnected: true)
+        far.controllerUUID = "aaaa0000000000000000000000000001"
+        checks.append(Check(
+            name: "smc: a rail follows its controller, not the matching port number",
+            passed: PortMonitor.channel(for: far, among: channels)?.index == 1,
+            detail: "port 4 should take channel 1, got \(PortMonitor.channel(for: far, among: channels)?.index.description ?? "nil")"))
+
+        var unknown = PortInfo(name: "USB-C", kind: .usbC, number: 1, isConnected: true)
+        unknown.controllerUUID = nil
+        checks.append(Check(
+            name: "smc: a port that names no controller takes no rail",
+            passed: PortMonitor.channel(for: unknown, among: channels) == nil,
+            detail: "matching by number here is how a port's power lands on its neighbour"))
+
+        // A machine whose SMC publishes no UUIDs at all is the one case where
+        // matching numbers is the best available answer, and is what Wattson
+        // has always done.
+        let unnamed = [
+            SMCMonitor.PortChannel(index: 1, controllerUUID: nil, sourceDescription: nil, power: nil),
+            SMCMonitor.PortChannel(index: 2, controllerUUID: nil, sourceDescription: nil,
+                                   power: SMCMonitor.PortPower(volts: 5, amps: 0.5)),
+        ]
+        var plain = PortInfo(name: "USB-C", kind: .usbC, number: 2, isConnected: true)
+        plain.controllerUUID = nil
+        checks.append(Check(
+            name: "smc: without DxUI anywhere, rail number is still used",
+            passed: PortMonitor.channel(for: plain, among: unnamed)?.index == 2))
+        return checks
+    }
+
+    // MARK: - What the CC line says about the socket
+
+    /// This Mac's own `IOPortTransportStateCC` node for USB-C port 1, read with
+    /// nothing plugged in.
+    private static let ccCapture: [String: Any] = [
+        "Active": false,
+        "TransportTypeDescription": "CC",
+        "ParentBuiltInPortNumber": 1,
+        "ParentPortTypeDescription": "USB-C",
+        "AuthenticationStatus": 0,
+        "AuthenticationStatusDescription": "Idle",
+        "AuthenticationRequired": false,
+        "AuthorizationStatusDescription": "Not Required",
+        "Tunneled": false,
+    ]
+
+    private static func connectionStateChecks() -> [Check] {
+        var checks: [Check] = []
+        let idle = PortMonitor.connectionState(from: ccCapture)
+        checks.append(Check(name: "cc: an empty socket reports nothing on the line",
+                            passed: !idle.active))
+        // "Idle" is what every port that has never authenticated anything says,
+        // and a line reading "Auth: Idle" on all three ports is noise.
+        checks.append(Check(name: "cc: an idle handshake is not a state worth a line",
+                            passed: idle.authentication == nil,
+                            detail: "got \(idle.authentication ?? "nil")"))
+
+        var challenged = ccCapture
+        challenged["Active"] = true
+        challenged["AuthenticationStatusDescription"] = "Authentication Failed"
+        let failed = PortMonitor.connectionState(from: challenged)
+        checks.append(Check(name: "cc: a live socket and a real handshake both survive",
+                            passed: failed.active && failed.authentication == "Authentication Failed",
+                            detail: "got \(failed.active), \(failed.authentication ?? "nil")"))
+
+        // The two occupancy readings come from different places, so the
+        // interesting case is them disagreeing — including the direction where
+        // the port reads empty, which is the one a connected-only view hides.
+        var quiet = PortInfo(name: "USB-C", kind: .usbC, number: 1, isConnected: false)
+        quiet.ccActive = true
+        checks.append(Check(name: "cc: a plug the controller has not noticed is a disagreement",
+                            passed: quiet.occupancyDisagreement))
+        var agreed = quiet
+        agreed.ccActive = false
+        checks.append(Check(name: "cc: two readings that agree are not a disagreement",
+                            passed: !agreed.occupancyDisagreement))
+        var silent = quiet
+        silent.ccActive = nil
+        checks.append(Check(name: "cc: a port with no CC node disagrees with nothing",
+                            passed: !silent.occupancyDisagreement))
+        return checks
+    }
+
+    // MARK: - Billboard alternate modes
+
+    /// A Billboard capability built to the USB Billboard Device Class spec:
+    /// two alternate modes, DisplayPort having been attempted and failed,
+    /// Thunderbolt's having come up, and the device reporting that it cannot
+    /// talk USB-PD.
+    ///
+    /// This fixture is written from the specification, not lifted from a
+    /// capture — no device carrying one has ever been attached to this machine.
+    /// So it is worth being clear about what these checks do and do not prove.
+    /// They prove the offsets in `Billboard.capability(from:)` agree with the
+    /// offsets used to build this, and that a descriptor which does not add up
+    /// is refused. They do not prove the specification is what the hardware
+    /// sends. The first dock plugged into this Mac settles that, and the
+    /// length equation below is what stands in until one is.
+    private static func billboardDescriptor(
+        modes: [(svid: Int, index: Int, state: Int)],
+        claimedModeCount: Int? = nil,
+        failureInfo: UInt8 = 0x01
+    ) -> [UInt8] {
+        var capability = [UInt8](repeating: 0, count: 44 + modes.count * 4)
+        capability[0] = UInt8(44 + modes.count * 4)
+        capability[1] = 0x10                                  // DEVICE CAPABILITY
+        capability[2] = 0x0D                                  // BILLBOARD
+        capability[4] = UInt8(claimedModeCount ?? modes.count)
+        capability[5] = 0                                     // preferred mode
+        capability[40] = 0x21                                 // bcdVersion 1.21
+        capability[41] = 0x01
+        capability[42] = failureInfo
+        for (index, mode) in modes.enumerated() {
+            // Two bits per mode inside bmConfigured, which starts at offset 8.
+            capability[8 + index / 4] |= UInt8(mode.state << ((index % 4) * 2))
+            let base = 44 + index * 4
+            capability[base] = UInt8(mode.svid & 0xFF)
+            capability[base + 1] = UInt8((mode.svid >> 8) & 0xFF)
+            capability[base + 2] = UInt8(mode.index)
+        }
+        let total = 5 + capability.count
+        return [5, 0x0F, UInt8(total & 0xFF), UInt8(total >> 8), 1] + capability
+    }
+
+    /// The real one: a VIA Labs billboard (2109:0102) inside a Lenovo dock,
+    /// captured 2026-08-25. Three capabilities — a container ID, the Billboard
+    /// capability, and a Billboard Alt Mode capability the parse steps over —
+    /// with one alternate mode that entered successfully.
+    ///
+    /// This is the fixture that proves the offsets, and it does so the way the
+    /// identity fixtures do rather than by remembering a number: the device
+    /// publishes "DisplayPort" separately as `UsbBillboardCurrentMode` in the
+    /// IORegistry, and the SVID decoded out of the descriptor has to come out
+    /// as 0xFF01, which is the same statement by a route that shares no code.
+    private static let lenovoDockBillboardBOS: [UInt8] = [
+        0x05, 0x0f, 0x51, 0x00, 0x03, 0x14, 0x10, 0x04, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x30, 0x10, 0x0d, 0x04, 0x01, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0x01, 0x00, 0x00, 0x01, 0xff, 0x00,
+        0x04, 0x08, 0x10, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]
+
+    private static func billboardChecks() -> [Check] {
+        var checks: [Check] = []
+
+        guard let real = BOSDescriptor.billboard(in: lenovoDockBillboardBOS) else {
+            checks.append(Check(name: "billboard: the dock's own descriptor decodes",
+                                passed: false, detail: "parse returned nil"))
+            return checks
+        }
+        checks.append(Check(
+            name: "billboard: the dock's own descriptor decodes to one mode",
+            passed: real.modes.count == 1,
+            detail: "got \(real.modes.count)"))
+        // The registry publishes "DisplayPort" for this device by a route that
+        // shares no code with the byte parse. 0xFF01 is that same statement.
+        checks.append(Check(
+            name: "billboard: the SVID matches what the registry calls the mode",
+            passed: real.modes.first?.svid == 0xFF01
+                && real.modes.first?.svidName == "DisplayPort",
+            detail: "got \(real.modes.first.map { String(format: "0x%04X", $0.svid) } ?? "nil")"))
+        // The dock's DisplayPort works, so the mode has to read as entered and
+        // the app has to stay quiet about it.
+        checks.append(Check(
+            name: "billboard: a working dock reports its mode entered, and says nothing",
+            passed: real.modes.first?.state == .succeeded && real.summary == nil,
+            detail: "state \(String(describing: real.modes.first?.state)), summary \(real.summary ?? "nil")"))
+        // A Billboard Alt Mode capability follows the Billboard one here, so
+        // the walk has to stop at the right capability rather than the last.
+        checks.append(Check(name: "billboard: the trailing alt-mode capability is not mistaken for it",
+                            passed: real.modes.count == 1 && !real.lacksPowerDelivery))
+        let bos = billboardDescriptor(modes: [
+            (svid: 0xFF01, index: 0, state: BillboardMode.State.failed.rawValue),
+            (svid: 0x8087, index: 1, state: BillboardMode.State.succeeded.rawValue),
+        ])
+        guard let capability = BOSDescriptor.billboard(in: bos) else {
+            checks.append(Check(name: "billboard: the capability is found inside the BOS descriptor",
+                                passed: false, detail: "parse returned nil"))
+            return checks
+        }
+        checks.append(Check(name: "billboard: the capability is found inside the BOS descriptor",
+                            passed: capability.modes.count == 2,
+                            detail: "got \(capability.modes.count) modes"))
+        checks.append(Check(
+            name: "billboard: each mode keeps its own SVID and its own outcome",
+            passed: capability.modes.first?.svid == 0xFF01
+                && capability.modes.first?.state == .failed
+                && capability.modes.last?.svid == 0x8087
+                && capability.modes.last?.state == .succeeded,
+            detail: "got \(capability.modes.map { "\($0.svidName) \($0.state)" }.joined(separator: ", "))"))
+        checks.append(Check(name: "billboard: the failing mode is the one reported",
+                            passed: capability.failures.count == 1
+                                && capability.summary?.contains("DisplayPort") == true))
+        checks.append(Check(name: "billboard: a device with no USB-PD says so alongside",
+                            passed: capability.lacksPowerDelivery
+                                && capability.summary?.contains("no USB-PD capability") == true,
+                            detail: "got \(capability.summary ?? "nil")"))
+
+        // A device whose modes all came up has nothing to explain, and a line
+        // reading "DisplayPort entered" under a working monitor is noise.
+        let working = billboardDescriptor(
+            modes: [(svid: 0xFF01, index: 0, state: BillboardMode.State.succeeded.rawValue)],
+            failureInfo: 0)
+        checks.append(Check(name: "billboard: a mode that came up is not worth a line",
+                            passed: BOSDescriptor.billboard(in: working)?.summary == nil))
+
+        // The guard that stands in for a real capture: a descriptor claiming a
+        // different number of modes than its own length accounts for has not
+        // been understood, whatever else it might look like.
+        let inconsistent = billboardDescriptor(
+            modes: [(svid: 0xFF01, index: 0, state: 2)], claimedModeCount: 3)
+        checks.append(Check(name: "billboard: a descriptor that does not add up is refused",
+                            passed: BOSDescriptor.billboard(in: inconsistent) == nil))
+
+        checks.append(Check(name: "billboard: a device with no BOS descriptor reports nothing",
+                            passed: BOSDescriptor.billboard(in: [0, 0, 0, 0, 0]) == nil))
+        // A zero-length capability descriptor would walk the BOS list forever.
+        checks.append(Check(name: "billboard: a zero-length capability does not hang the walk",
+                            passed: BOSDescriptor.billboard(in: [5, 0x0F, 9, 0, 1, 0, 0x10, 0x0D, 0]) == nil))
+        return checks
+    }
+
+    // MARK: - What took the SuperSpeed link
+
+    /// A passive cable whose Cable VDO declares the given speed rung. The
+    /// VDO is at index 3 and the rung is its low three bits, both of which
+    /// the e-marker checks above already establish against real captures.
+    private static func cable(speedRung: UInt32, vendorID: Int = 0x05AC) -> CableEMarker {
+        var emarker = CableEMarker()
+        emarker.productType = 3
+        emarker.vendorID = vendorID
+        emarker.vdos = [0, 0, 0, speedRung]
+        return emarker
+    }
+
+    /// A device carrying the BOS descriptor read off the real hardware.
+    private static func device(bos: [UInt8]?, mbps: Double?, name: String = "Device") -> DeviceNode {
+        var node = DeviceNode(name: name, kind: .usb)
+        node.speedCapability = bos.flatMap(BOSDescriptor.speeds(in:))
+        node.speedMbps = mbps
+        return node
+    }
+
+    /// The iPhone 16 Pro's BOS descriptor, 70 bytes across four capabilities,
+    /// read while it was charging off this Mac through a USB 2.0 cable.
+    ///
+    /// The platform capability's payload is zeroed: nothing here reads it, only
+    /// its length matters to the walk, and it is device-specific data that has
+    /// no business in a checked-in fixture. Everything else is verbatim.
+    private static let iPhoneBOS: [UInt8] = [
+        0x05, 0x0f, 0x46, 0x00, 0x04,                                     // BOS, 70 bytes, 4 caps
+        0x07, 0x10, 0x02, 0x02, 0x00, 0x00, 0x00,                         // USB 2.0 extension
+        0x1c, 0x10, 0x05, 0x00,                                           // platform capability
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x0a, 0x10, 0x03, 0x00, 0x0e, 0x00, 0x01, 0x0a, 0xff, 0x07,       // SuperSpeed
+        0x14, 0x10, 0x0a, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x11,       // SuperSpeedPlus
+        0x00, 0x00, 0x30, 0x40, 0x0a, 0x00, 0xb0, 0x40, 0x0a, 0x00,
+    ]
+
+    /// The Ugreen NVMe enclosure's, 42 bytes across three capabilities, read at
+    /// the same moment on the other port. Verbatim.
+    private static let ugreenBOS: [UInt8] = [
+        0x05, 0x0f, 0x2a, 0x00, 0x03,
+        0x07, 0x10, 0x02, 0x06, 0x00, 0x00, 0x00,
+        0x0a, 0x10, 0x03, 0x00, 0x0e, 0x00, 0x01, 0x0a, 0xff, 0x07,
+        0x14, 0x10, 0x0a, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x11,
+        0x00, 0x00, 0x30, 0x40, 0x0a, 0x00, 0xb0, 0x40, 0x0a, 0x00,
+    ]
+
+    /// A device that really is USB 2.0: a BOS with no SuperSpeed capability in
+    /// it at all. Built rather than captured — every device to hand turned out
+    /// to be SuperSpeed-capable.
+    private static let usb2OnlyBOS: [UInt8] = [
+        0x05, 0x0f, 0x0c, 0x00, 0x01,
+        0x07, 0x10, 0x02, 0x02, 0x00, 0x00, 0x00,
+    ]
+
+    private static func linkBottleneckChecks() -> [Check] {
+        var checks: [Check] = []
+
+        // Both devices publish the same claim, and the enclosure was measured
+        // running at it. That is what makes this self-validating rather than a
+        // remembered number: the parse is right only if the figure it pulls out
+        // of the descriptor equals the rate the controller independently
+        // reported for the device that actually got it.
+        let ugreen = BOSDescriptor.speeds(in: ugreenBOS)
+        checks.append(Check(
+            name: "bos: the claimed rate equals the rate the enclosure was measured at",
+            passed: ugreen?.declaredGbps == 10 && ugreen?.supportsSuperSpeed == true,
+            detail: "got \(show(ugreen?.declaredGbps)) Gbps, superSpeed=\(ugreen?.supportsSuperSpeed.description ?? "nil")"))
+        let iPhone = BOSDescriptor.speeds(in: iPhoneBOS)
+        checks.append(Check(
+            name: "bos: the phone claims the same, having enumerated at 480 Mbps",
+            passed: iPhone?.declaredGbps == 10 && iPhone?.supportsSuperSpeed == true,
+            detail: "got \(show(iPhone?.declaredGbps)) Gbps, superSpeed=\(iPhone?.supportsSuperSpeed.description ?? "nil")"))
+        // Nil rather than a false: the device published no speed capability at
+        // all, which is a different statement from one that published a
+        // capability saying no. Both fall out of the verdict; only one of them
+        // is a claim the device made.
+        checks.append(Check(name: "bos: a genuinely USB 2.0 device claims nothing about speed",
+                            passed: BOSDescriptor.speeds(in: usb2OnlyBOS) == nil,
+                            detail: "got \(String(describing: BOSDescriptor.speeds(in: usb2OnlyBOS)))"))
+        // The platform capability sits between the header and the SuperSpeed
+        // one on the phone and not on the enclosure, so the walk has to step
+        // over a capability it does not understand to reach either.
+        checks.append(Check(name: "bos: an unknown capability is stepped over, not tripped on",
+                            passed: iPhone?.declaredGbps == ugreen?.declaredGbps))
+
+        // The control. Same claim, and it got what it claimed.
+        checks.append(Check(
+            name: "link: the enclosure ran at 10 Gbps and is not a fault",
+            passed: LinkBottleneck.verdict(
+                for: device(bos: ugreenBOS, mbps: 10_000), port: nil, behind: nil) == nil))
+        checks.append(Check(
+            name: "link: a device that claims SuperSpeed and got 5 Gbps is not a fault",
+            passed: LinkBottleneck.verdict(
+                for: device(bos: ugreenBOS, mbps: 5000), port: nil, behind: nil) == nil))
+        checks.append(Check(
+            name: "link: a genuinely USB 2.0 device at 480 Mbps is not a fault",
+            passed: LinkBottleneck.verdict(
+                for: device(bos: usb2OnlyBOS, mbps: 480), port: nil, behind: nil) == nil))
+        checks.append(Check(
+            name: "link: a device with no BOS descriptor says nothing",
+            passed: LinkBottleneck.verdict(
+                for: device(bos: nil, mbps: 480), port: nil, behind: nil) == nil))
+        checks.append(Check(
+            name: "link: a device whose rate was never reported says nothing",
+            passed: LinkBottleneck.verdict(
+                for: device(bos: iPhoneBOS, mbps: nil), port: nil, behind: nil) == nil))
+
+        // The case the whole thing exists for, as it actually happened: the
+        // phone on the Baseus cable, whose chip declares USB 2.0.
+        let fallen = device(bos: iPhoneBOS, mbps: 480, name: "iPhone")
+        var usb2Port = PortInfo(name: "USB-C", kind: .usbC, number: 1, isConnected: true)
+        usb2Port.transportsSupported = ["CC", "USB2", "USB3", "CIO"]
+        usb2Port.emarker = cable(speedRung: 0b000)
+        let blamed = LinkBottleneck.verdict(for: fallen, port: usb2Port, behind: nil)
+        checks.append(Check(name: "link: a USB 2.0 cable is named as the cause",
+                            passed: blamed?.cause == .cableIsUSB2(chip: "Apple"),
+                            detail: "got \(blamed.map { String(describing: $0.cause) } ?? "nil")"))
+        checks.append(Check(name: "link: the verdict states both figures",
+                            passed: blamed?.summary.contains("10 Gbps") == true
+                                && blamed?.summary.contains("480 Mbps") == true,
+                            detail: blamed?.summary ?? "nil"))
+
+        // A cable claiming more than the link delivered is a disagreement, not
+        // a confession. Blaming it would accuse a cable that says it is fine.
+        var fastCablePort = usb2Port
+        fastCablePort.emarker = cable(speedRung: 0b010)
+        checks.append(Check(name: "link: a cable claiming 10 Gbps is not blamed for a 480 Mbps link",
+                            passed: LinkBottleneck.verdict(
+                                for: fallen, port: fastCablePort, behind: nil)?.cause == .unattributed))
+
+        // Lanes outrank the cable: a display holding both of them is a stated
+        // assignment, and it explains the same symptom.
+        var displayPort = fastCablePort
+        displayPort.phy = PhyLink(index: 0, lanes: [
+            PhyLane(name: "Lane 0", transport: "DisplayPort", powerLevel: "on", client: nil),
+            PhyLane(name: "Lane 1", transport: "DisplayPort", powerLevel: "on", client: nil),
+        ])
+        checks.append(Check(name: "link: a display holding both lanes outranks the cable",
+                            passed: LinkBottleneck.verdict(
+                                for: fallen, port: displayPort, behind: nil)?.cause == .displayTookTheLanes,
+                            detail: "takesAllLanes = \(displayPort.displayIsUsingAllLanes)"))
+
+        // One cable, one accusation. A hub that lost SuperSpeed explains
+        // everything under it, and the devices point at the hub rather than
+        // each repeating the charge against the cable.
+        var hub = device(bos: iPhoneBOS, mbps: 480, name: "USB2.0 Hub")
+        hub.children = [device(bos: ugreenBOS, mbps: 480, name: "Enclosure"),
+                        device(bos: iPhoneBOS, mbps: 480, name: "Card reader")]
+        var tree = [hub]
+        LinkBottleneck.annotate(&tree, port: usb2Port)
+        checks.append(Check(name: "link: the hub is the one blamed for the cable",
+                            passed: tree[0].linkVerdict?.cause == .cableIsUSB2(chip: "Apple")
+                                && tree[0].linkVerdict?.isRootCause == true))
+        checks.append(Check(
+            name: "link: everything behind the hub points at the hub",
+            passed: tree[0].children.allSatisfy {
+                $0.linkVerdict?.cause == .behindHub(name: "USB2.0 Hub")
+                    && $0.linkVerdict?.isRootCause == false
+            },
+            detail: "got \(tree[0].children.map { String(describing: $0.linkVerdict?.cause) }.joined(separator: ", "))"))
+
+        // A port with no USB 3 at all. Not a Mac, but the reader does not know
+        // that and the branch should not quietly become unreachable.
+        var slowPort = PortInfo(name: "USB-C", kind: .usbC, number: 1, isConnected: true)
+        slowPort.transportsSupported = ["CC", "USB2"]
+        checks.append(Check(name: "link: a port with no USB 3 answers for itself",
+                            passed: LinkBottleneck.verdict(
+                                for: fallen, port: slowPort, behind: nil)?.cause == .portHasNoUSB3))
+        return checks
+    }
+
+    // MARK: - What the cable's chip claims
+
+    /// The two real cables in `probes/`, as the same VDO bytes the identity
+    /// fixtures above already check against their captures.
+    ///
+    /// Two cables is a very small corpus, and it is why there are no
+    /// reserved-bit tells here. What it is big enough for is the point these
+    /// notes exist to make: the INIU cable publishes a vendor ID of zero and
+    /// charges an iPhone at 100 W, so a zeroed chip cannot be a verdict about
+    /// anything. whatcable reached the same conclusion from a corpus large
+    /// enough to catch Apple's own cables tripping their static flags.
+    private static func corpusCable(_ vdos: [[UInt8]], revision: Int = 3) -> CableEMarker {
+        var emarker = CableEMarker()
+        emarker.specificationRevision = revision
+        emarker.productType = 3
+        emarker.vendorID = Int(UInt32(vdos[0][0]) | UInt32(vdos[0][1]) << 8)
+        emarker.vdos = vdos.map { UInt32($0[0]) | UInt32($0[1]) << 8 | UInt32($0[2]) << 16 | UInt32($0[3]) << 24 }
+        return emarker
+    }
+
+    private static func cableNoteChecks() -> [Check] {
+        var checks: [Check] = []
+        // 240 W 20 Gbps C-to-C: vendor 1709, and a real certification ID.
+        let certified = corpusCable([[0xad, 0x06, 0x60, 0x1c], [0xf3, 0x29, 0x00, 0x00],
+                                     [0x00, 0x00, 0x00, 0x00], [0x42, 0x46, 0x08, 0x00]])
+        // Short INIU C-to-C: vendor zero, no certification ID, 100 W, USB 2.0.
+        let zeroed = corpusCable([[0x00, 0x00, 0x60, 0x18], [0x00, 0x00, 0x00, 0x00],
+                                  [0x00, 0x00, 0x00, 0x00], [0x40, 0x40, 0x08, 0x00]])
+
+        // The figure and the label come from one switch, so this is really a
+        // check that they cannot drift: the labels are already pinned against
+        // the captures by the identity checks above.
+        checks.append(Check(name: "cable: the speed figure agrees with the speed label",
+                            passed: certified.usbGbps == 10 && zeroed.usbGbps == 0.48,
+                            detail: "got \(show(certified.usbGbps)) and \(show(zeroed.usbGbps))"))
+
+        // The 240 W cable is the Lenovo ThinkVision's own, with "USB4 20Gbps
+        // 240W" printed on the jacket. Its wattage decodes to exactly the 240 W
+        // the jacket claims, from the same VDO — which is what makes the speed
+        // field's second reading a correction rather than a guess.
+        checks.append(Check(
+            name: "cable: the wattage decoded matches what is printed on the cable",
+            passed: certified.maxWatts == 240,
+            detail: "got \(show(certified.maxWatts)) W"))
+        checks.append(Check(
+            name: "cable: a 20 Gbps USB4 cable is not reported as a 10 Gbps one",
+            passed: certified.maximumGbps == 20,
+            detail: "got \(show(certified.maximumGbps)) Gbps"))
+        checks.append(Check(
+            name: "cable: both readings of the speed field are stated, neither picked",
+            passed: certified.usbSpeed?.contains("10 Gbps") == true
+                && certified.usbSpeed?.contains("20 Gbps") == true,
+            detail: certified.usbSpeed ?? "nil"))
+        // USB4 did not exist to be claimed under PD 3.0, so the same bits mean
+        // only the USB 3 reading on a cable answering at the older revision.
+        var older = certified
+        older.specificationRevision = 2
+        checks.append(Check(name: "cable: an older cable claims only what its revision could",
+                            passed: older.maximumGbps == 10 && older.usbSpeed == "USB 3.2 Gen 2 — 10 Gbps",
+                            detail: "got \(older.usbSpeed ?? "nil")"))
+        // A 20 Gbps link over a cable that claims 20 is not a contradiction.
+        checks.append(Check(
+            name: "cable: a link at the cable's USB4 rate is not called a disagreement",
+            passed: !PortInfo.cableNotes(emarker: certified, negotiatedWatts: nil, achievedGbps: 20)
+                .contains { $0.contains("came up at") }))
+
+        let certifiedNotes = PortInfo.cableNotes(
+            emarker: certified, negotiatedWatts: nil, achievedGbps: nil)
+        checks.append(Check(name: "cable: a certification ID is reported as an ID",
+                            passed: certifiedNotes.count == 1
+                                && certifiedNotes[0].contains("0x29F3"),
+                            detail: "got \(certifiedNotes.joined(separator: " | "))"))
+
+        let zeroedNotes = PortInfo.cableNotes(emarker: zeroed, negotiatedWatts: nil, achievedGbps: nil)
+        checks.append(Check(name: "cable: a zeroed vendor ID is a note, not a verdict",
+                            passed: zeroedNotes.count == 1
+                                && zeroedNotes[0].contains("no vendor ID")
+                                && !zeroedNotes[0].lowercased().contains("fake"),
+                            detail: "got \(zeroedNotes.joined(separator: " | "))"))
+        checks.append(Check(name: "cable: an uncertified cable is not accused of anything",
+                            passed: !zeroedNotes.contains { $0.contains("XID") }))
+
+        // Rated 100 W by its own chip. One-way: above the rating is proof,
+        // at or under it is the ordinary case and says nothing.
+        checks.append(Check(
+            name: "cable: being run above its own rating is stated",
+            passed: PortInfo.cableNotes(emarker: zeroed, negotiatedWatts: 140, achievedGbps: nil)
+                .contains { $0.contains("140 W") && $0.contains("100 W") }))
+        checks.append(Check(
+            name: "cable: being run at its rating is not worth a word",
+            passed: !PortInfo.cableNotes(emarker: zeroed, negotiatedWatts: 100, achievedGbps: nil)
+                .contains { $0.contains("rates at") }))
+
+        // The chip claims 10 Gbps and the controller measured 40. Both are
+        // stated; neither is silently preferred.
+        let contradiction = PortInfo.cableNotes(
+            emarker: certified, negotiatedWatts: nil, achievedGbps: 40)
+        checks.append(Check(name: "cable: a link faster than the chip claims states both figures",
+                            passed: contradiction.contains { $0.contains("40 Gbps") && $0.contains("20 Gbps") },
+                            detail: "got \(contradiction.joined(separator: " | "))"))
+        checks.append(Check(
+            name: "cable: a link matching the chip is not a contradiction",
+            passed: !PortInfo.cableNotes(emarker: certified, negotiatedWatts: nil, achievedGbps: 20)
+                .contains { $0.contains("came up at") }))
+
+        // A chip that answered with nothing has made no claims to check.
+        var withheld = CableEMarker()
+        withheld.productType = 3
+        withheld.vendorID = 0
+        checks.append(Check(name: "cable: a chip that published nothing gets no notes",
+                            passed: PortInfo.cableNotes(
+                                emarker: withheld, negotiatedWatts: 140, achievedGbps: 40).isEmpty))
+
+        // MARK: What the current rating may and may not be inferred from
+        //
+        // The regression these pin down: a 100 W UGREEN cable carrying a 15 W
+        // Type-C source was reported as "Up to 3 A (60 W)", because the panel
+        // read a 3 A contract as a statement about the cable. It is not one.
+        // Only the chip's own figure and a contract *above* 3 A can establish
+        // anything, and every other path has to say it does not know.
+        func port(
+            contract: PowerOption?, mechanism: String?, emarker: CableEMarker? = nil,
+            sourcing: Bool = false
+        ) -> PortInfo {
+            var port = PortInfo(name: "USB-C (test)", isConnected: true)
+            port.kind = .usbC
+            port.negotiated = contract
+            port.powerSourceKind = mechanism
+            port.emarker = emarker
+            if sourcing { port.outputWatts = 4.5 }
+            return port
+        }
+
+        let threeAmps = PowerOption(milliamps: 3000, milliwatts: 15_000)
+        let fiveAmps = PowerOption(milliamps: 5000, milliwatts: 100_000)
+
+        // The case that was wrong, and the one the user is most likely to hit:
+        // a phone charger that never opens a PD session at all.
+        let typeCOnly = port(contract: threeAmps, mechanism: "TypeC").currentRating
+        checks.append(Check(
+            name: "cable current: a 3 A Type-C contract rates nothing",
+            passed: !typeCOnly.contains("60 W") && !typeCOnly.contains("3 A ("),
+            detail: "got \(typeCOnly)"))
+        checks.append(Check(
+            name: "cable current: no PD handshake says the cable was never asked",
+            passed: typeCOnly.contains("never asked"),
+            detail: "got \(typeCOnly)"))
+
+        // A real PD contract at 3 A still proves nothing about the cable.
+        let pdSilent = port(contract: threeAmps, mechanism: "USB-PD").currentRating
+        checks.append(Check(
+            name: "cable current: a 3 A PD contract with no e-marker rates nothing",
+            passed: pdSilent.hasPrefix("Unknown") && !pdSilent.contains("60 W"),
+            detail: "got \(pdSilent)"))
+
+        // Above 3 A is the one inference that holds, and it still holds.
+        let over = port(contract: fiveAmps, mechanism: "USB-PD").currentRating
+        checks.append(Check(
+            name: "cable current: above 3 A still proves a 5 A e-marker",
+            passed: over.contains("5 A"),
+            detail: "got \(over)"))
+
+        // The chip's own word beats every inference, including that one.
+        let stated = port(contract: threeAmps, mechanism: "USB-PD", emarker: zeroed).currentRating
+        checks.append(Check(
+            name: "cable current: the chip's own figure wins over the contract",
+            passed: stated.contains("5 A") && stated.contains("100 W")
+                && stated.contains("from the cable's chip"),
+            detail: "got \(stated)"))
+
+        // A chip that was found and said nothing is a different answer from no
+        // chip at all: one of them means a capture here would be worth taking.
+        let empty = port(contract: threeAmps, mechanism: "USB-PD", emarker: withheld).currentRating
+        checks.append(Check(
+            name: "cable current: a silent chip is told apart from an absent one",
+            passed: empty != pdSilent && empty.hasPrefix("Unknown"),
+            detail: "got \(empty) against \(pdSilent)"))
+
+        // Unchanged: the Mac feeding a port caps itself at 3 A whatever the
+        // cable could take, so its own output is not evidence either.
+        let feeding = port(contract: nil, mechanism: nil, sourcing: true).currentRating
+        checks.append(Check(
+            name: "cable current: this Mac sourcing is not a cable rating",
+            passed: feeding.contains("this Mac is the source"),
+            detail: "got \(feeding)"))
+        return checks
+    }
+
+    // MARK: - What is on the end of the cable
+
+    private static func headlineChecks() -> [Check] {
+        var checks: [Check] = []
+        // A pair of headphones charging off the Mac negotiates no contract and
+        // presents no data. Read from the contract alone it is a bare cable.
+        var sinking = PortInfo(name: "USB-C", kind: .usbC, number: 2, isConnected: true)
+        sinking.transportsActive = ["CC"]
+        sinking.outputVolts = 5.14
+        sinking.outputAmps = 1.015
+        sinking.outputWatts = 5.21
+        checks.append(Check(name: "headline: a device drawing power is not a bare cable",
+                            passed: sinking.attachedHeadline == "Drawing power — no data link",
+                            detail: "got \(sinking.attachedHeadline)"))
+
+        var bare = sinking
+        bare.outputVolts = nil
+        bare.outputAmps = nil
+        bare.outputWatts = nil
+        checks.append(Check(name: "headline: a cable with nothing on it still says so",
+                            passed: bare.attachedHeadline == "Cable only — nothing negotiated",
+                            detail: "got \(bare.attachedHeadline)"))
+
+        var data = sinking
+        data.transportsActive = ["CC", "USB3"]
+        checks.append(Check(name: "headline: a data device drawing power says both",
+                            passed: data.attachedHeadline == "Data device, drawing power",
+                            detail: "got \(data.attachedHeadline)"))
+        return checks
+    }
+
+    // MARK: - Which display is on which port
+
+    /// The two DisplayPort transport nodes from the Thunderbolt dock capture,
+    /// verbatim but for the EDID blob, which nothing reads.
+    ///
+    /// Both monitors are the same model behind the same dock on the same port,
+    /// at the same link rate. Everything about them is identical except the
+    /// serial, which is exactly the case a join has to survive.
+    private static func dockDisplayNode(index: Int, serial: Int) -> [String: Any] {
+        [
+            "ParentBuiltInPortNumber": NSNumber(value: 2),
+            "Index": NSNumber(value: index),
+            "Active": true,
+            "Tunneled": true,
+            "LinkRateDescription": "8.1 Gbps (HBR3)",
+            "TransportDescription": "Port-USB-C@2/CIO/DisplayPort@\(index)",
+            "Metadata": [
+                "ManufacturerName": "DEL",
+                "ProductName": "DELL U2520D",
+                "ProductID": NSNumber(value: 0xA150),
+                "SerialNumber": NSNumber(value: serial),
+                "DFP Type Description": "DP",
+                "Year of Manufacture": NSNumber(value: 0x7E6),
+            ] as [String: Any],
+        ]
+    }
+
+    private static func displayLinkChecks() -> [Check] {
+        var checks: [Check] = []
+        // Serials as the controller published them, in decimal: 0x304E374C and
+        // 0x304E4D4C.
+        let first = DisplayLinkMonitor.link(from: dockDisplayNode(index: 0, serial: 0x304E374C))
+        let second = DisplayLinkMonitor.link(from: dockDisplayNode(index: 1, serial: 0x304E4D4C))
+        guard let first, let second else {
+            checks.append(Check(name: "display link: the dock's own nodes decode",
+                                passed: false, detail: "parse returned nil"))
+            return checks
+        }
+
+        checks.append(Check(
+            name: "display link: the controller names the port the display arrived on",
+            passed: first.portNumber == 2 && second.portNumber == 2,
+            detail: "got \(first.portNumber) and \(second.portNumber)"))
+        checks.append(Check(
+            name: "display link: the monitor's own name and link rate are read",
+            passed: first.productName == "DELL U2520D" && first.linkRate == "8.1 Gbps (HBR3)"
+                && first.connector == "DP" && first.isTunnelled,
+            detail: first.summary))
+
+        // CoreGraphics's account of the same two monitors, from the same
+        // capture. Vendor 4268 is 0x10AC, which is "DEL" in EDID's packed
+        // three-letter encoding, and 41296 is 0xA150 — so those two fields
+        // agree with the controller and identify *both* monitors equally.
+        // Only the serial separates them.
+        var left = DisplayInfo(id: 2)
+        left.vendorID = 4268; left.modelNumber = 41296; left.serial = 810_437_964
+        left.pixelWidth = 2560; left.pixelHeight = 1440; left.refreshHz = 60
+        var right = DisplayInfo(id: 3)
+        right.vendorID = 4268; right.modelNumber = 41296; right.serial = 810_432_332
+        right.pixelWidth = 2560; right.pixelHeight = 1440; right.refreshHz = 60
+
+        checks.append(Check(
+            name: "display link: the two APIs publish the same serial for the same monitor",
+            passed: UInt32(0x304E374C) == right.serial && UInt32(0x304E4D4C) == left.serial,
+            detail: "controller 0x304E374C = \(UInt32(0x304E374C)), CoreGraphics \(show(right.serial.map(Double.init)))"))
+
+        let joined = DisplayLinkMonitor.joinModes([first, second], displays: [left, right])
+        checks.append(Check(
+            name: "display link: each monitor gets its own mode, not its twin's",
+            passed: joined[0].mode?.id == 3 && joined[1].mode?.id == 2,
+            detail: "got \(String(describing: joined[0].mode?.id)) and \(String(describing: joined[1].mode?.id))"))
+
+        // The join must be the serial doing the work. Vendor and product are
+        // identical across the pair, so a join on those would be a coin toss
+        // that happens to be right half the time.
+        checks.append(Check(
+            name: "display link: vendor and product alone could not have told them apart",
+            passed: left.vendorID == right.vendorID && left.modelNumber == right.modelNumber
+                && left.serial != right.serial))
+        // A serial that matches nothing, or matches more than one, attaches no
+        // mode rather than the wrong one.
+        var ambiguous = right
+        ambiguous.serial = left.serial
+        checks.append(Check(
+            name: "display link: two displays claiming one serial get no mode at all",
+            passed: DisplayLinkMonitor.joinModes([second], displays: [left, ambiguous])[0].mode == nil))
+        var unserialised = first
+        unserialised.serial = 0
+        checks.append(Check(
+            name: "display link: a serial of zero is not an identifier",
+            passed: DisplayLinkMonitor.joinModes([unserialised], displays: [left, right])[0].mode == nil))
+        // A node with no port is not attachable, and attaching is the point.
+        checks.append(Check(
+            name: "display link: a node naming no port is refused",
+            passed: DisplayLinkMonitor.link(from: ["Index": NSNumber(value: 0)]) == nil))
+        return checks
+    }
+
+    // MARK: - Why a cable said nothing
+
+    private static func emarkerSilenceChecks() -> [Check] {
+        var checks: [Check] = []
+
+        // The BMW's rear USB-C port, as captured: USB 3 data running, power
+        // settled on Brick ID and Type-C at 5 V and 3 A, no SOP' node anywhere
+        // and three SOP nodes with empty metadata. The cable in it has an
+        // e-marker that reads perfectly well on a PD charger.
+        var car = PortInfo(name: "USB-C", kind: .usbC, number: 1, isConnected: true)
+        car.transportsActive = ["CC", "USB3", "USB2"]
+        car.powerSourceKind = "Brick ID"
+        car.negotiated = PowerOption(milliamps: 3000, milliwatts: 15000)
+        car.dataRole = "Device"
+        checks.append(Check(
+            name: "e-marker: a link that never negotiated PD explains its own silence",
+            passed: car.emarkerSilence?.contains("Brick ID") == true,
+            detail: car.emarkerSilence ?? "nil"))
+        // Says nothing was asked. Must not say the cable has a chip.
+        checks.append(Check(
+            name: "e-marker: the explanation claims nothing about the cable itself",
+            passed: {
+                guard let text = car.emarkerSilence?.lowercased() else { return false }
+                return !text.contains("has an e-marker") && !text.contains("is e-marked")
+            }()))
+        // "Passive" was being printed off a port default that nothing had
+        // tested, which reads as a finding about the cable.
+        checks.append(Check(
+            name: "e-marker: an uninterrogated cable is not called passive",
+            passed: car.cableWiringSummary == "Not interrogated",
+            detail: car.cableWiringSummary))
+
+        // A PD contract that produced no e-marker is a different statement: the
+        // cable could have been asked. Nothing is explained away there.
+        var pd = car
+        pd.powerSourceKind = "USB-PD"
+        checks.append(Check(name: "e-marker: silence under a PD contract is left unexplained",
+                            passed: pd.emarkerSilence == nil))
+        checks.append(Check(name: "e-marker: a cable under PD is described as passive again",
+                            passed: pd.cableWiringSummary == "Passive",
+                            detail: pd.cableWiringSummary))
+
+        // An empty port has no cable to have asked anything of.
+        var empty = car
+        empty.isConnected = false
+        checks.append(Check(name: "e-marker: an empty port explains nothing",
+                            passed: empty.emarkerSilence == nil))
+
+        // And a cable that did answer needs no explanation for not answering.
+        var answered = car
+        answered.emarker = cable(speedRung: 0b010)
+        checks.append(Check(name: "e-marker: a cable that answered is not excused",
+                            passed: answered.emarkerSilence == nil))
+        checks.append(Check(name: "e-marker: a cable that answered is described from its answer",
+                            passed: answered.cableWiringSummary.hasPrefix("Passive · "),
+                            detail: answered.cableWiringSummary))
+        return checks
+    }
+
+    // MARK: - The cable capping the charge
+
+    /// The INIU capture with one field changed: bits 6:5 of the Cable VDO
+    /// moved from 10b (5 A) to 01b (3 A). Assembled by hand because no 3 A
+    /// e-marker has ever answered on this Mac — every chip in `probes/`
+    /// declares 5 A — and changing only the current field keeps the rest of a
+    /// real node's shape around it.
+    private static let threeAmpCable: [String: Any] = {
+        var properties = identityCaptures[1].properties
+        var metadata = properties["Metadata"] as? [String: Any] ?? [:]
+        var vdos = metadata["VDOs"] as? [Data] ?? []
+        vdos[3] = vdoData([0x20, 0x40, 0x08, 0x00])
+        metadata["VDOs"] = vdos
+        properties["Metadata"] = metadata
+        return properties
+    }()
+
+    private static func cableLimitChecks() -> [Check] {
+        var checks: [Check] = []
+        let threeAmp = PortMonitor.identity(from: threeAmpCable)
+        let lenovo = PortMonitor.identity(from: identityCaptures[0].properties)
+        let iniu = PortMonitor.identity(from: identityCaptures[1].properties)
+        let belkinCharger = PortMonitor.identity(from: identityCaptures[2].properties)
+        let unread = PortMonitor.identity(from: identityCaptures[5].properties)
+
+        // The fixture is only worth anything if the edit landed on the current
+        // field and nowhere else: the captured chip it came from reads 5 A, and
+        // its speed must survive the edit untouched.
+        checks.append(Check(
+            name: "cable limit: the hand-built chip differs from its capture only in current",
+            passed: threeAmp.maxAmps == 3 && iniu.maxAmps == 5 && threeAmp.usbSpeed == iniu.usbSpeed,
+            detail: "got \(show(threeAmp.maxAmps)) A against \(show(iniu.maxAmps)) A"))
+
+        let twentyThree = PowerOption(milliamps: 3000, milliwatts: 60000)
+        func verdict(
+            usbC: Bool = true, pd: Bool = true, _ emarker: CableEMarker?,
+            contract: PowerOption? = twentyThree, input: Double? = 57.8, ceiling: Double? = 70,
+            best: Double? = nil
+        ) -> CableLimit? {
+            CableLimit.verdict(isUSBC: usbC, hasPDContract: pd, emarker: emarker,
+                               contract: contract, inputWatts: input, macCeilingWatts: ceiling,
+                               chargerBestWatts: best)
+        }
+
+        // The one case that fires: a chip stating 3 A, 20 V at 3 A, a 70 W Mac
+        // drawing all of it.
+        let fired = verdict(threeAmp)
+        checks.append(Check(
+            name: "cable limit: a 3 A chip at a 60 W contract, drawn in full, is named",
+            passed: fired == CableLimit(watts: 60, amps: 3, evidence: .chip),
+            detail: fired?.summary ?? "nil"))
+        // It says the cable is a ceiling, and admits what it cannot see.
+        checks.append(Check(
+            name: "cable limit: the line does not claim the charger had more",
+            passed: fired.map { !$0.summary.lowercased().contains("charger") } ?? false
+                && fired?.caveat.contains("cannot be seen") == true,
+            detail: fired?.summary ?? "nil"))
+
+        // Silent wherever something else explains the wattage, or nothing was
+        // stated. Real chips and real readings where there are any.
+        let silent: [(String, CableLimit?)] = [
+            // A 5 A chip at a 3 A contract: the charger, not the cable.
+            ("the captured 240 W Lenovo cable at 20 V / 3 A", verdict(lenovo)),
+            ("the captured 100 W INIU cable at 20 V / 3 A", verdict(iniu)),
+            // The one-way trap from the other side: no chip, or a chip that said
+            // nothing, is not a chip stating 3 A. The first is a real reading:
+            // a 100 W charger through a "60 W" C-to-C, no SOP' node, the SOP
+            // node's Metadata empty, every offer clamped to 3 A — and the line
+            // stays silent even though the cable really is what is holding
+            // that charger back, because nothing here can see that it is.
+            ("no e-marker answered", verdict(nil)),
+            ("the captured e-marker that answered with nothing", verdict(unread)),
+            // The Belkin 70 W charger answering at SOP has a fourth VDO to misread.
+            ("a charger's own identity standing in for a cable", verdict(belkinCharger)),
+            // Charger tops out below the cable.
+            ("a 15 V / 3 A top offer", verdict(threeAmp,
+                contract: PowerOption(milliamps: 3000, milliwatts: 45000), input: 44)),
+            ("a 20 V / 2.25 A top offer", verdict(threeAmp,
+                contract: PowerOption(milliamps: 2250, milliwatts: 45000), input: 44)),
+            // Over the chip's rating: `cableNotes` says that, and it is no limit.
+            ("a 20 V / 5 A contract over a 3 A chip", verdict(threeAmp,
+                contract: PowerOption(milliamps: 5000, milliwatts: 100000), input: 69)),
+            // The battery deciding it: the 80% hold, as measured in
+            // snapshot-after-27-fixed and snapshot-after-27.
+            ("a pack at its 80% hold drawing 27.11 W", verdict(threeAmp, input: 27.11)),
+            ("a pack at its 80% hold drawing 33.25 W", verdict(threeAmp, input: 33.25)),
+            ("no live input reading", verdict(threeAmp, input: nil)),
+            // The Mac deciding it.
+            ("a 61 W 13\" M1 Pro", verdict(threeAmp, ceiling: 61)),
+            ("a 30 W M1 Air", verdict(threeAmp, ceiling: 30)),
+            ("a Mac missing from the table", verdict(threeAmp, ceiling: nil)),
+            // Nothing asked the cable: the BMW's Brick ID / Type-C 5 V 3 A.
+            ("a Type-C current advertisement", verdict(pd: false, threeAmp,
+                contract: PowerOption(milliamps: 3000, milliwatts: 15000), input: 14)),
+            ("MagSafe", verdict(usbC: false, threeAmp)),
+            // The same-charger path. A chip declaring 5 A means the charger
+            // was free to offer more and chose not to.
+            ("a 5 A chip on a charger that offered 96 W before", verdict(lenovo, best: 96)),
+            ("a charger that never offered more than 60 W", verdict(nil, best: 60)),
+            ("a charger seen before, at its 80% hold", verdict(nil, input: 27.11, best: 96)),
+        ]
+        for (name, result) in silent {
+            checks.append(Check(name: "cable limit: silent for \(name)",
+                                passed: result == nil, detail: result?.summary))
+        }
+
+        // The common case: a plain 60 W cable with no chip, as all three on
+        // this desk were, on a charger remembered offering more. The contract
+        // and the silence are this desk's real reading on 15 October; the
+        // 96 W memory is supplied, because the charger used then publishes no
+        // serial to remember it by.
+        let remembered = verdict(nil, best: 96)
+        checks.append(Check(
+            name: "cable limit: a chipless cable on a charger seen offering 96 W is named",
+            passed: remembered == CableLimit(watts: 60, amps: 3, evidence: .sameCharger(bestWatts: 96)),
+            detail: remembered?.summary ?? "nil"))
+        checks.append(Check(
+            name: "cable limit: a chip that answered with nothing counts as no claim of 5 A",
+            passed: verdict(unread, best: 96) != nil))
+        // Memory is only consulted for a brick that can be told apart from
+        // every other: Apple's, by serial. Anything else answers nil before
+        // the stored table is read.
+        var thirdParty = PowerSnapshot()
+        thirdParty.externalConnected = true
+        thirdParty.adapterSerial = "C0FFEE"
+        thirdParty.adapterManufacturer = "Anker"
+        checks.append(Check(name: "cable limit: a third-party brick's serial is never consulted",
+                            passed: ChargerMemory.bestWatts(for: thirdParty) == nil))
+
+        // Two contracts, one measured input: nothing to attribute it to.
+        var front = PortInfo(name: "USB-C (front)", kind: .usbC, number: 1, isConnected: true)
+        front.negotiated = twentyThree
+        var rear = front
+        rear.name = "USB-C (rear)"
+        rear.number = 2
+        checks.append(Check(
+            name: "cable limit: the charging port is found when it is the only one",
+            passed: CableLimit.chargingPort(in: [front])?.name == front.name))
+        checks.append(Check(
+            name: "cable limit: two contracts leave the charging port unnamed",
+            passed: CableLimit.chargingPort(in: [front, rear]) == nil))
+        return checks
+    }
+
+    // MARK: - Menu bar wattage
+
+    /// Every wattage the bar can show below 10^(places+1) W carries exactly
+    /// places+1 digits, which is what keeps it one width, and still reads back
+    /// to within half its last place of the figure it was made from — so a
+    /// formatter that held its width by losing the value fails as surely as
+    /// one that let the width move.
+    private static func menuBarWattsChecks() -> [Check] {
+        var checks: [Check] = []
+        for places in [1, 2] {
+            // At this even a whole number rounds up to another digit, so the
+            // sweep stays strictly inside it.
+            let ceiling = pow(10, Double(places + 1)) - 0.5
+            var drifted: [String] = []
+            var value = -ceiling + 0.0137
+            while value < ceiling {
+                let text = DeviceModel.watts(value, places: places, signed: true)
+                let number = text.dropLast(2)
+                let digits = number.filter(\.isNumber).count
+                let decimals = number.split(separator: ".").dropFirst().first?.count ?? 0
+                let error = abs((Double(number) ?? .nan) - value)
+                if digits != places + 1 || !(error <= pow(10, -Double(decimals)) / 2 + 1e-9) {
+                    drifted.append(text)
+                }
+                value += 0.0137
+            }
+            checks.append(Check(
+                name: "menu bar watts: \(places + 1) digits, true to the last place, at \(places) decimals",
+                passed: drifted.isEmpty))
+        }
+        checks.append(Check(
+            name: "menu bar watts: rounding up past 10 W drops a decimal (9.996 is 10.0 W)",
+            passed: DeviceModel.watts(9.996, places: 2) == "10.0 W"))
+        return checks
+    }
+
+    // MARK: - What rides inside a Thunderbolt link
+
+    private static func tunnelChecks() -> [Check] {
+        var checks: [Check] = []
+
+        // The Amazon Basics dock, as captured: one cable carrying USB3, two
+        // DisplayPort streams for two monitors, and PCIe present but not up.
+        var dock = PortInfo(name: "USB-C", kind: .usbC, number: 2, isConnected: true)
+        dock.transportsActive = ["CC", "USB2", "CIO"]
+        dock.tunnels = [
+            PortTunnel(name: "DisplayPort", index: 0, isActive: true),
+            PortTunnel(name: "DisplayPort", index: 1, isActive: true),
+            PortTunnel(name: "PCIe", index: 0, isActive: false),
+            PortTunnel(name: "USB3", index: 0, isActive: true),
+        ]
+        let summary = dock.tunnelSummary ?? ""
+        // The port's own transport list stops at CIO, which is the whole reason
+        // this exists: two monitors are running and it never mentions a display.
+        checks.append(Check(
+            name: "tunnel: the port's own transport list says nothing about the displays",
+            passed: !dock.transportsActive.contains("DisplayPort")))
+        checks.append(Check(
+            name: "tunnel: the running protocols are named, displays numbered apart",
+            passed: summary.contains("DisplayPort 0") && summary.contains("DisplayPort 1")
+                && summary.contains("USB3"),
+            detail: summary))
+        // A dock whose PCIe never comes up is the complaint this answers, so an
+        // idle tunnel has to be named rather than quietly dropped.
+        checks.append(Check(
+            name: "tunnel: a tunnel that is offered but not running is still named",
+            passed: summary.contains("PCIe") && summary.contains("not running"),
+            detail: summary))
+        // Only one PCIe, so numbering it would be noise.
+        checks.append(Check(name: "tunnel: a lone tunnel is not given an index",
+                            passed: !summary.contains("PCIe 0"),
+                            detail: summary))
+
+        var none = dock
+        none.tunnels = []
+        checks.append(Check(name: "tunnel: a port with no tunnels says nothing",
+                            passed: none.tunnelSummary == nil))
+        var allIdle = dock
+        allIdle.tunnels = [PortTunnel(name: "PCIe", index: 0, isActive: false)]
+        checks.append(Check(name: "tunnel: a link with nothing running says so",
+                            passed: allIdle.tunnelSummary == "PCIe offered, none running",
+                            detail: allIdle.tunnelSummary ?? "nil"))
+
+        // The Mac is the host almost always, and the almost is what is worth
+        // printing: in the car it was the device.
+        var car = PortInfo(name: "USB-C", kind: .usbC, number: 1, isConnected: true)
+        car.dataRole = "Device"
+        checks.append(Check(name: "tunnel: the Mac being the device end is noticed",
+                            passed: car.isDeviceRole))
+        car.dataRole = "Host"
+        checks.append(Check(name: "tunnel: the ordinary host role is not remarked on",
+                            passed: !car.isDeviceRole))
+        return checks
+    }
+
+    // MARK: - The input rail in the seconds after plugging in
+
+    private static func staleInputChecks() -> [Check] {
+        var checks: [Check] = []
+
+        // A Ugreen Nexode power bank, in the window where the SMC had seen the
+        // power arrive and the registry had not: PDTR reporting 9.80 W against
+        // a PowerTelemetryData copy still describing an unplugged machine.
+        var fresh = PowerSnapshot()
+        fresh.externalConnected = true
+        fresh.inputWatts = 9.80
+        fresh.inputVolts = 0
+        fresh.inputAmps = 0
+        fresh.profiles = [
+            PDProfile(id: 0, volts: 5, amps: 3), PDProfile(id: 1, volts: 9, amps: 3),
+            PDProfile(id: 2, volts: 12, amps: 3), PDProfile(id: 3, volts: 15, amps: 3),
+            PDProfile(id: 4, volts: 20, amps: 5),
+        ]
+        fresh.negotiatedProfile = 4
+        checks.append(Check(name: "input: the negotiated contract's own voltage is found",
+                            passed: fresh.negotiatedVolts == 20,
+                            detail: "got \(show(fresh.negotiatedVolts))"))
+
+        let corrected = PowerMonitor.correctStaleInput(fresh)
+        checks.append(Check(
+            name: "input: a stale zero rail is filled in from the contract",
+            passed: corrected.inputVolts == 20,
+            detail: "got \(show(corrected.inputVolts)) V"))
+        checks.append(Check(
+            name: "input: the current follows from the wattage the SMC measured",
+            passed: corrected.inputAmps.map { abs($0 - 9.80 / 20) < 0.0001 } ?? false,
+            detail: "got \(show(corrected.inputAmps)) A"))
+
+        // A rail that is actually reading must not be overwritten. A supply
+        // sagging under load is a fact worth seeing, and the contract voltage
+        // is exactly what would hide it.
+        var measured = fresh
+        measured.inputVolts = 19.2
+        measured.inputAmps = 0.5
+        let untouched = PowerMonitor.correctStaleInput(measured)
+        checks.append(Check(name: "input: a real measurement is left alone, sag included",
+                            passed: untouched.inputVolts == 19.2 && untouched.inputAmps == 0.5,
+                            detail: "got \(show(untouched.inputVolts)) V"))
+
+        // Nothing arriving is not a stale reading, it is the answer.
+        var idle = fresh
+        idle.inputWatts = 0
+        checks.append(Check(name: "input: an idle port is not given a contract voltage",
+                            passed: PowerMonitor.correctStaleInput(idle).inputVolts == 0))
+        // Power arriving with no contract to consult stays as it was found.
+        var noContract = fresh
+        noContract.negotiatedProfile = nil
+        checks.append(Check(name: "input: without a contract nothing is invented",
+                            passed: PowerMonitor.correctStaleInput(noContract).inputVolts == 0))
+        // An index naming a profile that is not in the menu is not a voltage.
+        var missing = fresh
+        missing.negotiatedProfile = 9
+        checks.append(Check(name: "input: an index with no profile behind it is not a voltage",
+                            passed: PowerMonitor.correctStaleInput(missing).inputVolts == 0))
+        return checks
+    }
+
+    // MARK: - Holding, charging or draining
+
+    /// Lines from `--watch` on this Mac, held at an 80% charge limit on a
+    /// 20 V contract, 16 October: input, load, the flow computed from them, and
+    /// the pack's terminals read in the same second. The SMC's load is one
+    /// sample behind its input, so each "flow" is the input's change since the
+    /// second before. Self-validating in the same spirit as the identity
+    /// fixtures: the previous line's input is carried alongside, and it has to
+    /// equal this line's load for the fixture to describe the artefact at all.
+    private static let heldAtLimit: [(previousIn: Double, input: Double, load: Double, packMilliamps: Double)] = [
+        (4.40, 10.69, 4.40, 0),    // load stepping up: +6.29 W "into" the cell
+        (9.49, 3.15, 9.49, 0),     // and back down: -6.34 W "out" of it
+        (3.25, 3.12, 3.25, 0),     // quiet: -0.13 W, which flipped the word
+        (17.08, 16.10, 17.08, 0),  // 17 W of load: -0.98 W
+        (3.24, 3.27, 3.24, 0),     // inside the old deadband already: +0.03 W
+    ]
+    private static let heldPackMillivolts = 12_557.0
+
+    /// PDTR, PSTR, B0AV and B0AC from the raw SMC section of each capture.
+    private static let heldCaptures: [(name: String, pdtr: Double, pstr: Double, b0av: Double, b0ac: Double)] = [
+        ("100 W charger, first 60 W cable", 16.701267, 10.894113, 12_557, 0),
+        ("100 W charger, second 60 W cable", 13.525156, 11.485348, 12_559, 0),
+        ("Thunderbolt 4 dock", 11.835917, 5.4795504, 12_576, 0),
+        ("after-27", 40.590015, 39.089035, 12_500, 0),
+        ("after-27-fixed", 26.32318, 32.2086, 12_500, 0),
+    ]
+
+    private static func cellFlowChecks() -> [Check] {
+        var checks: [Check] = []
+
+        for line in heldAtLimit {
+            var held = PowerSnapshot()
+            held.externalConnected = true
+            held.batteryPercent = 80
+            held.inputWatts = line.input
+            held.systemLoadWatts = line.load
+            held.batteryWatts = line.input - line.load
+            held.batteryVolts = heldPackMillivolts
+            held.batteryAmps = line.packMilliamps
+            let flow = String(format: "%+.2f W", line.input - line.load)
+            checks.append(Check(
+                name: "cell: held at a limit, \(flow) of lag reads as holding",
+                passed: line.previousIn == line.load && held.batteryState == "holding",
+                detail: "got \(held.batteryState ?? "nil"), previous input \(line.previousIn) against load \(line.load)"))
+            // And the number the reader hands on is the terminals', not the lag.
+            let terminals = SMCMonitor.BatteryReading(volts: heldPackMillivolts, amps: line.packMilliamps)
+            let watts = PowerMonitor.batteryWatts(
+                computed: line.input - line.load, externalConnected: true, terminals: terminals)
+            checks.append(Check(
+                name: "flow: held at a limit, \(flow) of lag becomes the terminals' 0 W",
+                passed: watts == 0,
+                detail: "got \(show(watts))"))
+            // Nor does the bar grow a battery segment out of the lag.
+            let charging = held.allocation?.segments.contains { $0.id == "battery" } ?? false
+            checks.append(Check(
+                name: "cell: held at a limit, \(flow) puts no battery in the bar",
+                passed: !charging))
+        }
+
+        // The same at a single instant, from the raw captures in `probes/`:
+        // PDTR, PSTR, B0AV and B0AC exactly as the SMC published them. Every
+        // one was taken at an 80% hold, so the cell carries nothing, and the
+        // difference between the first two is whatever the lag left in it.
+        for capture in heldCaptures {
+            let terminals = SMCMonitor.BatteryReading(volts: capture.b0av, amps: capture.b0ac)
+            let watts = PowerMonitor.batteryWatts(
+                computed: capture.pdtr - capture.pstr, externalConnected: true, terminals: terminals)
+            checks.append(Check(
+                name: "flow: \(capture.name), \(String(format: "%+.2f W", capture.pdtr - capture.pstr)) computed at a hold reads 0 W",
+                passed: watts == 0,
+                detail: "got \(show(watts))"))
+        }
+
+        // Charging, BMW M340i rear port, 25 August: 13.95 W in, 9.33 W load,
+        // and 334 mA into a 12.312 V pack. The terminals' 4.11 W is the figure;
+        // the 4.62 W difference is within the charger's own loss of it.
+        let bmw = SMCMonitor.BatteryReading(volts: 12_312, amps: 334)
+        let bmwWatts = PowerMonitor.batteryWatts(
+            computed: 13.948727 - 9.325635, externalConnected: true, terminals: bmw)
+        checks.append(Check(
+            name: "flow: charging on the BMW port reads the terminals' 4.11 W",
+            passed: bmwWatts.map { abs($0 - 4.112) < 0.001 } ?? false,
+            detail: "got \(show(bmwWatts))"))
+
+        // Off a charger the computed flow stands, terminals or not: before-27,
+        // on battery, 11.86 W of load and the pack giving 1187 mA.
+        let unplugged = SMCMonitor.BatteryReading(volts: 11_795, amps: -1_187)
+        let unpluggedWatts = PowerMonitor.batteryWatts(
+            computed: 0.00046655253 - 11.862187, externalConnected: false, terminals: unplugged)
+        checks.append(Check(
+            name: "flow: on battery the computed flow is kept",
+            passed: unpluggedWatts == 0.00046655253 - 11.862187,
+            detail: "got \(show(unpluggedWatts))"))
+
+        // And a charger whose terminals did not answer keeps the computed flow
+        // rather than reporting nothing.
+        let silent = PowerMonitor.batteryWatts(
+            computed: 1.25, externalConnected: true, terminals: SMCMonitor.BatteryReading())
+        checks.append(Check(name: "flow: on a charger with no terminals, the computed flow stays",
+                            passed: silent == 1.25, detail: "got \(show(silent))"))
+
+        // A real drain on a charger still says so. Constructed, not captured:
+        // the drain seen on 15 October (a 34.6 W load on 21.5 W) predates the
+        // terminal column. 1.05 A out of a 12.4 V pack is 13 W.
+        var draining = PowerSnapshot()
+        draining.externalConnected = true
+        draining.inputWatts = 21.5
+        draining.systemLoadWatts = 34.6
+        draining.batteryWatts = -13.1
+        draining.batteryVolts = 12_400
+        draining.batteryAmps = -1_050
+        checks.append(Check(name: "cell: a real drain on a charger reads as draining",
+                            passed: draining.batteryState == "draining",
+                            detail: "got \(draining.batteryState ?? "nil")"))
+
+        // And the terminals win over the flow in the other direction too: a lag
+        // spike that makes the flow look like charge going in does not make a
+        // draining cell read as charging.
+        var masked = draining
+        masked.batteryWatts = 2.4
+        checks.append(Check(name: "cell: a lag spike does not hide a drain the terminals see",
+                            passed: masked.batteryState == "draining",
+                            detail: "got \(masked.batteryState ?? "nil")"))
+
+        // Genuinely charging, as measured on this Mac while charging (12.370 V
+        // x 3.183 A at the pack).
+        var charging = PowerSnapshot()
+        charging.externalConnected = true
+        charging.inputWatts = 45.9
+        charging.systemLoadWatts = 6.84
+        charging.batteryWatts = 39.06
+        charging.batteryVolts = 12_370
+        charging.batteryAmps = 3_183
+        checks.append(Check(name: "cell: charging on a charger reads as charging",
+                            passed: charging.batteryState == "charging"
+                                && charging.allocation?.segments.contains { $0.id == "battery" } == true,
+                            detail: "got \(charging.batteryState ?? "nil")"))
+
+        // Without terminals to read, a charger falls back to the flow and the
+        // deadband it always had, rather than to silence or a guess.
+        var noTerminals = PowerSnapshot()
+        noTerminals.externalConnected = true
+        noTerminals.batteryWatts = -0.13
+        checks.append(Check(name: "cell: on a charger with no terminals, the flow still decides",
+                            passed: noTerminals.batteryState == "draining",
+                            detail: "got \(noTerminals.batteryState ?? "nil")"))
+
+        // Off the charger nothing changed. The flow is minus the load there,
+        // with no input to lag behind, and it is read exactly as before even
+        // when the terminals say something slightly different.
+        var onBattery = PowerSnapshot()
+        onBattery.externalConnected = false
+        onBattery.batteryWatts = -0.13
+        onBattery.batteryVolts = 12_557
+        onBattery.batteryAmps = 0
+        checks.append(Check(name: "cell: on battery, the flow decides as it always did",
+                            passed: onBattery.batteryState == "draining",
+                            detail: "got \(onBattery.batteryState ?? "nil")"))
+        onBattery.batteryWatts = 0.03
+        checks.append(Check(name: "cell: on battery, a flow inside the deadband is idle",
+                            passed: onBattery.batteryState == "idle",
+                            detail: "got \(onBattery.batteryState ?? "nil")"))
+        return checks
+    }
+
+    // MARK: - Lifetime pack temperature
+
+    private static func packTemperatureChecks() -> [Check] {
+        var checks: [Check] = []
+        // This Mac: whole degrees by magnitude, and the current reading sits
+        // inside the range, so both signals agree.
+        let whole = PowerMonitor.lifetimeTemperatureRange(minimum: 1, maximum: 38, current: 30.2)
+        checks.append(Check(name: "pack temperature: whole degrees read as whole degrees",
+                            passed: whole?.minimum == 1 && whole?.maximum == 38,
+                            detail: "got \(whole.map { "\($0.minimum)...\($0.maximum)" } ?? "nil")"))
+
+        // The reading that had another tool reporting 454 °C.
+        let tenths = PowerMonitor.lifetimeTemperatureRange(minimum: -80, maximum: 454, current: 30.2)
+        checks.append(Check(name: "pack temperature: 454 is 45.4 °C, not 454 °C",
+                            passed: tenths?.maximum == 45.4 && tenths?.minimum == -8,
+                            detail: "got \(tenths.map { "\($0.minimum)...\($0.maximum)" } ?? "nil")"))
+
+        // Magnitude says tenths, containment says whole degrees. Two signals
+        // pointing opposite ways is not a resolved scale.
+        checks.append(Check(name: "pack temperature: a disagreement reports nothing",
+                            passed: PowerMonitor.lifetimeTemperatureRange(
+                                minimum: 20, maximum: 90, current: 85) == nil))
+
+        // An uninitialised blob reads as zero whichever way it is scaled.
+        checks.append(Check(name: "pack temperature: an empty range is not a reading",
+                            passed: PowerMonitor.lifetimeTemperatureRange(
+                                minimum: 0, maximum: 0, current: 30.2) == nil))
+        return checks
+    }
+
+    // MARK: - PD Discover Identity
+
+    /// One recorded `IOPortTransportComponentCCUSBPD*` node.
+    private struct IdentityCapture {
+        let name: String
+        /// Where it was read: the cable's chip, or the far end.
+        let isCablePath: Bool
+        let properties: [String: Any]
+        /// What the reader should make of it, in the terms the panel uses.
+        let expectedSpeed: String?
+        let expectedAmps: Double?
+        let expectedWatts: Double?
+    }
+
+    private static func vdoData(_ bytes: [UInt8]) -> Data { Data(bytes) }
+
+    /// Captures from `probes/`, oldest first. Each carries a real cable or
+    /// device that was actually plugged into this Mac.
+    private static let identityCaptures: [IdentityCapture] = [
+        IdentityCapture(
+            name: "SOP' — 240 W 20 Gbps C-to-C (Lenovo dock, Sony XM6 captures)",
+            isCablePath: true,
+            properties: [
+                "Specification Revision": 3,
+                "Vendor ID": 1709,
+                "Product ID": 0,
+                "Product Type": 3,
+                "Product Type Description": "Passive Cable",
+                "Metadata": [
+                    "Vendor ID": 1709,
+                    "Product ID": 0,
+                    "Product Type": 3,
+                    "Product Type Description": "Passive Cable",
+                    "VDO Count": 4,
+                    "VDOs": [
+                        vdoData([0xad, 0x06, 0x60, 0x1c]),
+                        vdoData([0xf3, 0x29, 0x00, 0x00]),
+                        vdoData([0x00, 0x00, 0x00, 0x00]),
+                        vdoData([0x42, 0x46, 0x08, 0x00]),
+                    ],
+                ] as [String: Any],
+            ],
+            // The name of this fixture has said 20 Gbps since it was written
+            // and the expectation under it said 10, which is the whole of the
+            // bug: the encoding means both and only one was being read. The
+            // jacket says "USB4 20Gbps 240W", and the 240 W below decodes out
+            // of the same VDO.
+            expectedSpeed: "USB 3.2 Gen 2 — 10 Gbps, or 20 Gbps as USB4 Gen 2",
+            expectedAmps: 5,
+            expectedWatts: 240
+        ),
+        IdentityCapture(
+            name: "SOP' — short INIU C-to-C (iPhone 16 Pro capture)",
+            isCablePath: true,
+            properties: [
+                "Specification Revision": 3,
+                "Vendor ID": 0,
+                "Product ID": 0,
+                "Product Type": 3,
+                "Product Type Description": "Passive Cable",
+                "Metadata": [
+                    "Vendor ID": 0,
+                    "Product ID": 0,
+                    "Product Type": 3,
+                    "Product Type Description": "Passive Cable",
+                    "VDO Count": 4,
+                    "VDOs": [
+                        vdoData([0x00, 0x00, 0x60, 0x18]),
+                        vdoData([0x00, 0x00, 0x00, 0x00]),
+                        vdoData([0x00, 0x00, 0x00, 0x00]),
+                        vdoData([0x40, 0x40, 0x08, 0x00]),
+                    ],
+                ] as [String: Any],
+            ],
+            // A 100 W cable that carries nothing faster than USB 2.0. This is
+            // the pairing worth being able to state out loud: it charges a
+            // laptop and it will still make a drive crawl.
+            expectedSpeed: "USB 2.0 — 480 Mbps",
+            expectedAmps: 5,
+            expectedWatts: 100
+        ),
+        IdentityCapture(
+            name: "SOP — Belkin 70 W travel charger",
+            isCablePath: false,
+            properties: [
+                "Specification Revision": 3,
+                "Vendor ID": 12054,
+                "Product ID": 0,
+                "Metadata": [
+                    "Vendor ID": 12054,
+                    "Product ID": 0,
+                    "bcdDevice": 0,
+                    "VDO Count": 4,
+                    "VDOs": [
+                        vdoData([0x16, 0x2f, 0xc0, 0x01]),
+                        vdoData([0x00, 0x00, 0x00, 0x00]),
+                        vdoData([0x00, 0x00, 0x00, 0x00]),
+                        vdoData([0x00, 0x00, 0x00, 0x40]),
+                    ],
+                ] as [String: Any],
+            ],
+            // A charger is not a cable, so the cable readings must stay silent
+            // even though there is a fourth VDO sitting there to misread.
+            expectedSpeed: nil, expectedAmps: nil, expectedWatts: nil
+        ),
+        IdentityCapture(
+            name: "SOP — iPhone 16 Pro (six VDOs)",
+            isCablePath: false,
+            properties: [
+                "Specification Revision": 3,
+                "Vendor ID": 1452,
+                "Product ID": 29975,
+                "Metadata": [
+                    "Vendor ID": 1452,
+                    "Product ID": 29975,
+                    "bcdDevice": 12547,
+                    "VDO Count": 6,
+                    "VDOs": [
+                        vdoData([0xac, 0x05, 0x40, 0xd5]),
+                        vdoData([0x00, 0x00, 0x00, 0x00]),
+                        vdoData([0x03, 0x31, 0x17, 0x75]),
+                        vdoData([0x32, 0x00, 0x00, 0x65]),
+                        vdoData([0x00, 0x00, 0x00, 0x00]),
+                        vdoData([0x00, 0x00, 0x00, 0x43]),
+                    ],
+                ] as [String: Any],
+            ],
+            expectedSpeed: nil, expectedAmps: nil, expectedWatts: nil
+        ),
+        IdentityCapture(
+            name: "SOP — Ludtom USB-C hub",
+            isCablePath: false,
+            properties: [
+                "Specification Revision": 3,
+                "Vendor ID": 8457,
+                "Product ID": 258,
+                "Metadata": [
+                    "Vendor ID": 8457,
+                    "Product ID": 258,
+                    "bcdDevice": 1,
+                    "VDO Count": 4,
+                    "VDOs": [
+                        vdoData([0x09, 0x21, 0x00, 0x6c]),
+                        vdoData([0x7e, 0x03, 0x00, 0x00]),
+                        vdoData([0x01, 0x00, 0x02, 0x01]),
+                        vdoData([0x3b, 0x00, 0x00, 0x00]),
+                    ],
+                ] as [String: Any],
+            ],
+            expectedSpeed: nil, expectedAmps: nil, expectedWatts: nil
+        ),
+        IdentityCapture(
+            name: "SOP' — empty Metadata (Belkin capture, cable idle)",
+            isCablePath: true,
+            properties: [
+                "Specification Revision": 1,
+                "Metadata": [:] as [String: Any],
+            ],
+            // The node exists, so there is an e-marker. It said nothing, so
+            // nothing may be claimed about it.
+            expectedSpeed: nil, expectedAmps: nil, expectedWatts: nil
+        ),
+        IdentityCapture(
+            name: "SOP — bare node, no Metadata at all (lone cable capture)",
+            isCablePath: false,
+            properties: ["ParentPortNumber": 2],
+            expectedSpeed: nil, expectedAmps: nil, expectedWatts: nil
+        ),
+    ]
+
+    /// `String(describing:)` on an optional prints "Optional(5.0)"; this is
+    /// only ever read by a person comparing two values in a terminal.
+    private static func show(_ value: Double?) -> String {
+        guard let value else { return "nil" }
+        return String(format: "%g", value)
+    }
+
+    private static func identityChecks() -> [Check] {
+        var checks: [Check] = []
+        for capture in identityCaptures {
+            let identity = PortMonitor.identity(from: capture.properties)
+
+            // The cross-check that pins the byte order without a spec to hand.
+            if let vendorID = identity.vendorID, let header = identity.vdos.first {
+                let fromVDO = Int(header & 0xFFFF)
+                checks.append(Check(
+                    name: "\(capture.name): ID Header vendor matches published vendor",
+                    passed: fromVDO == vendorID,
+                    detail: fromVDO == vendorID
+                        ? nil
+                        : "VDO[0] says 0x\(String(fromVDO, radix: 16)), node says 0x\(String(vendorID, radix: 16)) — byte order is wrong"
+                ))
+            } else if !capture.properties.isEmpty, capture.properties["Metadata"] != nil,
+                      let metadata = capture.properties["Metadata"] as? [String: Any], !metadata.isEmpty {
+                checks.append(Check(
+                    name: "\(capture.name): VDOs decoded",
+                    passed: false,
+                    detail: "no VDOs came back from a capture that has them"
+                ))
+            }
+
+            checks.append(Check(
+                name: "\(capture.name): speed",
+                passed: identity.usbSpeed == capture.expectedSpeed,
+                detail: identity.usbSpeed == capture.expectedSpeed
+                    ? nil : "got \(identity.usbSpeed ?? "nil"), expected \(capture.expectedSpeed ?? "nil")"
+            ))
+            checks.append(Check(
+                name: "\(capture.name): current rating",
+                passed: identity.maxAmps == capture.expectedAmps,
+                detail: identity.maxAmps == capture.expectedAmps
+                    ? nil : "got \(show(identity.maxAmps)), expected \(show(capture.expectedAmps))"
+            ))
+            checks.append(Check(
+                name: "\(capture.name): wattage rating",
+                passed: identity.maxWatts == capture.expectedWatts,
+                detail: identity.maxWatts == capture.expectedWatts
+                    ? nil : "got \(show(identity.maxWatts)), expected \(show(capture.expectedWatts))"
+            ))
+        }
+        // An endpoint that never stated a product type must not be reported
+        // as a passive cable, and a node carrying only a spec revision does
+        // not identify anybody. Both were live bugs: an empty SOP node was
+        // filed as a partner device, and every unread chip read as "passive".
+        let lone = PortMonitor.identity(from: [
+            "Specification Revision": 1, "Metadata": [:] as [String: Any],
+        ])
+        checks.append(Check(name: "identity: an unread chip is neither active nor passive",
+                            passed: lone.isActive == nil))
+        checks.append(Check(name: "identity: a spec revision alone identifies nobody",
+                            passed: !lone.identifiesItself))
+        let cable = PortMonitor.identity(from: identityCaptures[0].properties)
+        checks.append(Check(name: "identity: a stated passive cable is reported as passive",
+                            passed: cable.isActive == false && cable.identifiesItself))
+        let charger = PortMonitor.identity(from: identityCaptures[2].properties)
+        checks.append(Check(name: "identity: a charger with VDOs identifies itself",
+                            passed: charger.identifiesItself && charger.isActive == nil))
+
+        // A PD endpoint publishes a vendor ID and never a name, so the table
+        // is the only route from a cable's chip to a manufacturer.
+        checks.append(Check(name: "identity: a known vendor ID resolves to a name",
+                            passed: cable.vendorName == "Greatland Electronics",
+                            detail: "got \(cable.vendorName ?? "nil")"))
+        checks.append(Check(name: "identity: the charger's vendor resolves too",
+                            passed: charger.vendorName == "Shenzhen Kejinming",
+                            detail: "got \(charger.vendorName ?? "nil")"))
+        // An unlisted ID still says something useful: it is what you would
+        // paste into a search.
+        let unlisted = PortMonitor.identity(from: ["Metadata": ["Vendor ID": 0x9ABC] as [String: Any]])
+        checks.append(Check(name: "identity: an unlisted vendor falls back to its ID",
+                            passed: unlisted.vendorName == "0x9ABC",
+                            detail: "got \(unlisted.vendorName ?? "nil")"))
+        checks.append(Check(name: "identity: no vendor ID means no vendor",
+                            passed: lone.vendorName == nil))
+        // 0x2E99 read "Anker" for as long as the table has existed and belongs
+        // to Hynetek Semiconductor, who make the PD controller inside a great
+        // many cables — including the Baseus C-to-C that this Mac reported as
+        // Anker. Checked against the USB-IF list, which is what the ID in a PD
+        // e-marker is registered with.
+        checks.append(Check(name: "identity: 0x2E99 is the chip maker, not a cable brand",
+                            passed: Scanner.vendorName(forID: 0x2E99) == "Hynetek Semiconductor",
+                            detail: "got \(Scanner.vendorName(forID: 0x2E99) ?? "nil")"))
+
+        // A populated node met first, then an empty one for the same address:
+        // the walk visits children in whatever order IOKit hands them over,
+        // and the reading that says something has to survive.
+        let populated = PortMonitor.identity(from: identityCaptures[0].properties)
+        let empty = PortMonitor.identity(from: ["Metadata": [:] as [String: Any]])
+        checks.append(Check(
+            name: "identity: an empty node does not wipe out a chip that answered",
+            passed: !populated.contentsWithheld && empty.contentsWithheld
+        ))
+        return checks
+    }
+
+    // MARK: - Battery condition and charging holds
+
+    /// This Mac's own `AppleSmartBattery` dictionary, reduced to the keys the
+    /// readers touch. A healthy machine reports zero for every fault counter,
+    /// so a live read cannot tell a working parse from one that silently
+    /// returns nothing — hence the deliberately damaged fixtures further down.
+    private static let batteryCapture: [String: Any] = [
+        "CycleCount": 12,
+        "DesignCycleCount9C": 1000,
+        "DesignCapacity": 4629,
+        "NominalChargeCapacity": 4746,
+        "AppleRawMaxCapacity": 4619,
+        "Temperature": 3006,
+        "PermanentFailureStatus": 0,
+        "BatteryCellDisconnectCount": 0,
+        "BatteryData": [
+            "CycleCount": 12,
+            // The extremes are one level down, in LifetimeData, and this
+            // fixture used to put them beside it — matching what the reader
+            // expected rather than what the hardware publishes, so it passed
+            // while the app showed nothing.
+            "LifetimeData": [
+                "MaximumTemperature": 38,
+                "MinimumTemperature": 1,
+            ] as [String: Any],
+        ] as [String: Any],
+        "ChargerData": [
+            "ChargingVoltage": 4249,
+            "ChargingCurrent": 0,
+            "NotChargingReason": 128,
+            "SlowChargingReason": 0,
+            "ChargerInhibitReason": 0,
+            "TimeChargingThermallyLimited": 0,
+        ] as [String: Any],
+    ]
+
+    private static func batteryChecks() -> [Check] {
+        var checks: [Check] = []
+        let health = PowerMonitor.health(from: batteryCapture)
+
+        checks.append(Check(name: "battery: cycle count", passed: health.cycleCount == 12,
+                            detail: "got \(health.cycleCount.map(String.init) ?? "nil")"))
+        checks.append(Check(name: "battery: temperature is hundredths of a degree",
+                            passed: health.temperature == 30.06,
+                            detail: "got \(show(health.temperature)) °C"))
+        // A pack fresh enough to exceed its design figure. The reader must not
+        // quietly clamp this — the UI is what decides how to show it.
+        let capacity = health.capacityPercent ?? 0
+        checks.append(Check(name: "battery: capacity is reported uncapped above 100%",
+                            passed: capacity > 102 && capacity < 103,
+                            detail: "got \(show(health.capacityPercent))%"))
+        checks.append(Check(name: "battery: cycle life used", passed: health.cyclePercent == 1.2,
+                            detail: "got \(show(health.cyclePercent))%"))
+        checks.append(Check(name: "battery: temperature extremes come from LifetimeData",
+                            passed: health.maximumTemperature == 38 && health.minimumTemperature == 1,
+                            detail: "got \(show(health.minimumTemperature)) to \(show(health.maximumTemperature))"))
+        checks.append(Check(name: "battery: a healthy pack does not ask for service",
+                            passed: !health.needsService))
+
+        // A latched fault has to survive being read, or the one condition
+        // worth interrupting someone over never gets there.
+        var faulty = batteryCapture
+        faulty["PermanentFailureStatus"] = 1
+        checks.append(Check(name: "battery: a latched permanent failure asks for service",
+                            passed: PowerMonitor.health(from: faulty).needsService))
+        var disconnected = batteryCapture
+        disconnected["BatteryCellDisconnectCount"] = 2
+        checks.append(Check(name: "battery: a disconnected cell asks for service",
+                            passed: PowerMonitor.health(from: disconnected).needsService))
+
+        let hold = PowerMonitor.chargingHold(from: batteryCapture)
+        checks.append(Check(name: "charging: raw reason is carried, not interpreted",
+                            passed: hold.notChargingReason == 128))
+        // On battery there is no adapter, so there is nothing to explain.
+        checks.append(Check(name: "charging: says nothing with no adapter attached",
+                            passed: hold.summary(externalConnected: false, isCharging: false) == nil))
+        checks.append(Check(name: "charging: says nothing while charging normally",
+                            passed: hold.summary(externalConnected: true, isCharging: true) == nil))
+        // Attached, not charging, setpoint zero — and nothing to say about it.
+        // The capture behind `hold` is a pack sitting at an 80% charge limit,
+        // which is the ordinary state of a Mac left plugged in, and the panel
+        // already reads "holding" beside the percentage. Naming a cause needs a
+        // flag macOS does not publish; see `ChargingHold.summary`.
+        checks.append(Check(
+            name: "charging: a zero setpoint alone explains nothing",
+            passed: hold.summary(externalConnected: true, isCharging: false) == nil,
+            detail: "got \(hold.summary(externalConnected: true, isCharging: false) ?? "nil")"))
+
+        var hot = PowerMonitor.chargingHold(from: batteryCapture)
+        hot.secondsThermallyLimited = 90
+        checks.append(Check(
+            name: "charging: heat is still named when the setpoint is zero",
+            passed: hot.summary(externalConnected: true, isCharging: false)
+                == "Charging is being limited by temperature."))
+        return checks
+    }
+
+    // MARK: - The macOS 27 battery tree
+
+    /// The same Mac on macOS 27, reduced to the keys the readers touch. The top
+    /// node keeps the cycle count and a `BatteryData` with capacity in it; the
+    /// rest moved to the two children. Serial numbers left out.
+    private static let batteryTopCapture27: [String: Any] = [
+        "CycleCount": 21,
+        "DesignCycleCount9C": 1000,
+        "CurrentCapacity": 80,
+        "BatteryData": [
+            "FullChargeCapacity": 4535,
+            "NominalChargeCapacity": 4662,
+            "DesignCapacity": 4629,
+            "MaxCapacity": 100,
+            "CurrentCapacity": 80,
+        ] as [String: Any],
+        "ChargerData": [
+            "NotChargingReason": 16_777_216,
+            "SlowChargingReason": 0,
+            "TimeChargingThermallyLimited": 0,
+            "IsCharging": 0,
+        ] as [String: Any],
+    ]
+
+    /// `AppleSmartBatteryPack`.
+    private static let batteryPackCapture27: [String: Any] = [
+        "ID": 0,
+        "BankCount": 3,
+        "BatteryData": [
+            "CycleCount": 21,
+            "DesignCapacity": 4629,
+            "NominalChargeCapacity": 4662,
+            "AppleRawMaxCapacity": 4535,
+            "Temperature": 2839,
+            "VirtualTemperature": 2839,
+            "PermanentFailureStatus": 0,
+            "BatteryCellDisconnectCount": 0,
+            "LifetimeData": [
+                "MaximumTemperature": 38,
+                "MinimumTemperature": 1,
+                "AverageTemperature": 193,
+            ] as [String: Any],
+        ] as [String: Any],
+    ]
+
+    /// `AppleChargerData`.
+    private static let chargerCapture27: [String: Any] = [
+        "ID": 0,
+        "ChargerData": [
+            "ChargingCurrent": 0,
+            "ChargingVoltage": 4217,
+            "ChargerInhibitReason": 0,
+            "NotChargingReason": 16_777_216,
+            "SlowChargingReason": 0,
+            "TimeChargingThermallyLimited": 0,
+        ] as [String: Any],
+    ]
+
+    private static func batteryTreeChecks() -> [Check] {
+        var checks: [Check] = []
+
+        // The failure itself, kept reproducible: the top node on its own is
+        // what the reader saw on macOS 27, and it knows nothing about condition.
+        let alone = PowerMonitor.health(from: PowerMonitor.batteryProperties(
+            top: batteryTopCapture27, packs: [], chargers: []))
+        checks.append(Check(name: "battery tree: the top node alone has no temperature",
+                            passed: alone.temperature == nil && alone.maximumTemperature == nil))
+        // Capacity is the exception: it survives inside the top node's own
+        // BatteryData, so it must not depend on finding the pack.
+        checks.append(Check(name: "battery tree: capacity is read from the top node's BatteryData",
+                            passed: alone.capacityPercent.map { $0 > 100.7 && $0 < 100.8 } ?? false,
+                            detail: "got \(show(alone.capacityPercent))%"))
+
+        let merged = PowerMonitor.batteryProperties(
+            top: batteryTopCapture27, packs: [batteryPackCapture27], chargers: [chargerCapture27])
+        let health = PowerMonitor.health(from: merged)
+        // Self-validating rather than remembered: the pack publishes the gauge
+        // temperature twice, as Temperature and VirtualTemperature, and the
+        // reading has to agree with the one the reader does not use.
+        let packData = batteryPackCapture27["BatteryData"] as? [String: Any]
+        let virtual = (packData?["VirtualTemperature"] as? Int).map { Double($0) / 100 }
+        checks.append(Check(name: "battery tree: temperature comes from the pack",
+                            passed: health.temperature != nil && health.temperature == virtual,
+                            detail: "got \(show(health.temperature)) °C"))
+        checks.append(Check(name: "battery tree: temperature extremes come from the pack's LifetimeData",
+                            passed: health.minimumTemperature == 1 && health.maximumTemperature == 38,
+                            detail: "got \(show(health.minimumTemperature)) to \(show(health.maximumTemperature))"))
+        checks.append(Check(name: "battery tree: cycle count is unchanged",
+                            passed: health.cycleCount == 21 && health.designCycleCount == 1000))
+        checks.append(Check(name: "battery tree: a healthy pack does not ask for service",
+                            passed: !health.needsService))
+
+        // The warning this whole change exists for. A fault latched on the
+        // pack has to reach the panel through the tree.
+        var faultyPack = batteryPackCapture27
+        var faultyData = faultyPack["BatteryData"] as? [String: Any] ?? [:]
+        faultyData["PermanentFailureStatus"] = 1
+        faultyPack["BatteryData"] = faultyData
+        checks.append(Check(
+            name: "battery tree: a permanent failure on the pack asks for service",
+            passed: PowerMonitor.health(from: PowerMonitor.batteryProperties(
+                top: batteryTopCapture27, packs: [faultyPack], chargers: [])).needsService))
+
+        // Two packs, one condition line: nothing to choose between them with.
+        let ambiguous = PowerMonitor.health(from: PowerMonitor.batteryProperties(
+            top: batteryTopCapture27, packs: [batteryPackCapture27, faultyPack], chargers: []))
+        checks.append(Check(name: "battery tree: two packs are not guessed between",
+                            passed: ambiguous.temperature == nil && !ambiguous.needsService))
+
+        let hold = PowerMonitor.chargingHold(from: merged)
+        checks.append(Check(name: "battery tree: the charge setpoint comes from the charger node",
+                            passed: hold.chargingVoltageMV == 4217 && hold.chargingCurrentMA == 0,
+                            detail: "got \(show(hold.chargingVoltageMV)) mV"))
+        checks.append(Check(name: "battery tree: the reason is still carried raw",
+                            passed: hold.notChargingReason == 16_777_216))
+
+        // macOS 26 and earlier must read exactly as before, even if a child
+        // disagrees: the top node wins every key it publishes.
+        var disagreeingPack = batteryPackCapture27
+        var disagreeingData = disagreeingPack["BatteryData"] as? [String: Any] ?? [:]
+        disagreeingData["Temperature"] = 9999
+        disagreeingData["PermanentFailureStatus"] = 1
+        disagreeingPack["BatteryData"] = disagreeingData
+        let flat = PowerMonitor.health(from: PowerMonitor.batteryProperties(
+            top: batteryCapture, packs: [disagreeingPack], chargers: [chargerCapture27]))
+        checks.append(Check(name: "battery tree: a flat layout is not overridden by a child",
+                            passed: flat.temperature == 30.06 && !flat.needsService
+                                && flat.maximumTemperature == 38,
+                            detail: "got \(show(flat.temperature)) °C"))
+        let flatHold = PowerMonitor.chargingHold(from: PowerMonitor.batteryProperties(
+            top: batteryCapture, packs: [], chargers: [chargerCapture27]))
+        checks.append(Check(name: "battery tree: a flat charger reading is not overridden",
+                            passed: flatHold.chargingVoltageMV == 4249 && flatHold.notChargingReason == 128))
+        return checks
+    }
+
+    // MARK: - The charger's whole offer
+
+    /// Thirteen words, padded the way the registry pads them.
+    private static func pdoArray(_ words: [Any]) -> [Any] {
+        words + Array(repeating: 0, count: 13 - words.count) as [Any]
+    }
+
+    private static func menu(_ steps: [(mV: Int, mA: Int)]) -> [[String: Any]] {
+        steps.enumerated().map { index, step in
+            ["Index": index, "MaxVoltage": step.mV, "MaxCurrent": step.mA]
+        }
+    }
+
+    /// The Amazon Basics Thunderbolt 4 dock feeding this Mac, 25 August, macOS
+    /// 26. The adapter details and the port controller array are two separate
+    /// publications of the same offer: the menu in millivolts and milliamps,
+    /// the array as raw PD words in 50 mV and 10 mA units. Decoding the words
+    /// correctly is the only way they agree, and the whole feature is gated on
+    /// that agreement, so this fixture passing is the proof that the fixed
+    /// layout is read right.
+    private static let dockPowerCapture: [String: Any] = [
+        "ExternalConnected": true,
+        "AdapterDetails": [
+            "Watts": 85,
+            "UsbHvcHvcIndex": 3,
+            "UsbHvcMenu": menu([(5000, 3000), (9000, 3000), (15000, 3000), (20000, 4250)]),
+        ] as [String: Any],
+        "PortControllerInfo": [
+            ["PortControllerActiveContractRdo": 0, "PortControllerNPDOs": 0,
+             "PortControllerPortPDO": pdoArray([])] as [String: Any],
+            ["PortControllerActiveContractRdo": 0x4385a168, "PortControllerNPDOs": 4,
+             "PortControllerPortPDO": pdoArray([0x2f01912c, 0x2d12c, 0x4b12c, 0x641a9])] as [String: Any],
+        ] as [[String: Any]],
+    ]
+
+    /// The same dock on macOS 27, 17 September, now rated 96 W: the 20 V step
+    /// at 4.8 A, the peak-current bits set on every word, and both controller
+    /// entries carrying the identical array and request. Why the dock changed
+    /// its offer is not recorded anywhere.
+    private static let dockPowerCapture27: [String: Any] = {
+        let words: [Any] = [0x2f11912c, 0x12d12c, 0x14b12c, 0x1641e0]
+        return [
+            "ExternalConnected": true,
+            "AdapterDetails": [
+                "Watts": 96,
+                "UsbHvcHvcIndex": 3,
+                "UsbHvcMenu": menu([(5000, 3000), (9000, 3000), (15000, 3000), (20000, 4800)]),
+            ] as [String: Any],
+            "PortControllerInfo": [
+                ["PortControllerActiveContractRdo": 0x4385a168, "PortControllerNPDOs": 4,
+                 "PortControllerPortPDO": pdoArray(words)] as [String: Any],
+                ["PortControllerActiveContractRdo": 0x4385a168, "PortControllerNPDOs": 4,
+                 "PortControllerPortPDO": pdoArray(words)] as [String: Any],
+            ] as [[String: Any]],
+        ]
+    }()
+
+    /// The 100 W charger's words, left behind in the second entry on 15
+    /// September with nothing plugged in at all. The sixth word is the only
+    /// PPS offer ever captured on this machine, and it arrives the way the
+    /// registry hands it over: sign-extended to 64 bits. Note the count says
+    /// five.
+    private static let leftoverChargerWords: [Any] = [
+        0x801912c, 0x2d12c, 0x3c12c, 0x4b12c, 0x641f4, Int64(bitPattern: 0xffff_ffff_c1a4_3264),
+    ]
+
+    /// That capture as it was: nothing attached, the adapter details empty,
+    /// and the first entry still holding the dock's array *and* its request.
+    private static let nothingAttachedCapture: [String: Any] = [
+        "ExternalConnected": false,
+        "AdapterDetails": ["FamilyCode": 0] as [String: Any],
+        "PortControllerInfo": [
+            ["PortControllerActiveContractRdo": 0x4385a168, "PortControllerNPDOs": 4,
+             "PortControllerPortPDO": pdoArray([0x2f11912c, 0x12d12c, 0x14b12c, 0x1641e0])] as [String: Any],
+            ["PortControllerActiveContractRdo": 0, "PortControllerNPDOs": 5,
+             "PortControllerPortPDO": pdoArray(leftoverChargerWords)] as [String: Any],
+        ] as [[String: Any]],
+    ]
+
+    /// A 100 W charger with PPS plugged straight into this Mac, 15 October,
+    /// macOS 27: the first capture of a PPS offer from a charger that was
+    /// attached at the time. All three entries as they read. The first is
+    /// the charger: five fixed words that agree with the menu, and the PPS
+    /// word sixth against a count of five. The second is the dock's array left
+    /// over from an earlier session, and the third a near copy of this
+    /// charger's offer from another — every current 10-40 mA lower and the
+    /// PPS current zero — that no longer agrees with anything.
+    ///
+    /// The first entry's request word is the dock's, `0x4385a168`, naming
+    /// slot 4. The charger is delivering 20 V, which is slot 5, and the menu
+    /// says index 4. So even on the entry describing the attached charger,
+    /// the request is not a record of the contract.
+    private static let ppsChargerCapture: [String: Any] = [
+        "ExternalConnected": true,
+        "AdapterDetails": [
+            "Watts": 100,
+            "UsbHvcHvcIndex": 4,
+            "UsbHvcMenu": menu([(5000, 3000), (9000, 3000), (12000, 3000), (15000, 3000), (20000, 5000)]),
+        ] as [String: Any],
+        "PortControllerInfo": [
+            ["PortControllerActiveContractRdo": 1_132_831_080, "PortControllerNPDOs": 5,
+             "PortControllerPortPDO": pdoArray([
+                134_320_428, 184_620, 246_060, 307_500, 410_100, UInt64(18_446_744_072_663_347_807),
+             ])] as [String: Any],
+            ["PortControllerActiveContractRdo": 1_132_831_080, "PortControllerNPDOs": 4,
+             "PortControllerPortPDO": pdoArray([789_680_428, 1_233_196, 1_356_076, 1_458_656])] as [String: Any],
+            ["PortControllerActiveContractRdo": 0, "PortControllerNPDOs": 5,
+             "PortControllerPortPDO": pdoArray([
+                134_320_424, 184_618, 246_058, 307_499, 410_099, UInt64(18_446_744_072_663_347_200),
+             ])] as [String: Any],
+        ] as [[String: Any]],
+    ]
+
+    /// The BMW's rear port through a Ugreen cable, 25 August: three fixed
+    /// offers in the controller and an empty menu.
+    private static let carPortCapture: [String: Any] = [
+        "ExternalConnected": true,
+        "AdapterDetails": [
+            "Watts": 15, "UsbHvcHvcIndex": 0xff, "UsbHvcMenu": [] as [[String: Any]],
+        ] as [String: Any],
+        "PortControllerInfo": [
+            ["PortControllerActiveContractRdo": 0, "PortControllerNPDOs": 0,
+             "PortControllerPortPDO": pdoArray([])] as [String: Any],
+            ["PortControllerActiveContractRdo": 0x3782592c, "PortControllerNPDOs": 3,
+             "PortControllerPortPDO": pdoArray([0x801912c, 0x2d0c8, 0x3c096])] as [String: Any],
+        ] as [[String: Any]],
+    ]
+
+    private static func sourceCapabilityChecks() -> [Check] {
+        var checks: [Check] = []
+        func describe(_ capabilities: SourceCapabilities?) -> String {
+            guard let capabilities else { return "nothing" }
+            return capabilities.slots.map { "\($0.position): \($0.offer.summary)" }.joined(separator: "; ")
+        }
+
+        // The fixed layout, proven against the menu the same capture publishes.
+        let dock = PowerMonitor.sourceCapabilities(from: dockPowerCapture)
+        checks.append(Check(name: "source caps: the dock's raw words agree with its own menu",
+                            passed: dock?.slots.count == 4,
+                            detail: "got \(describe(dock))"))
+        checks.append(Check(name: "source caps: a fixed-only charger gains no invented offer",
+                            passed: dock?.additionalOffers.isEmpty == true,
+                            detail: "got \(dock?.additionalOffers.map(\.summary) ?? [])"))
+        let dock27 = PowerMonitor.sourceCapabilities(from: dockPowerCapture27)
+        checks.append(Check(name: "source caps: macOS 27's twin entries, peak bits set, still agree",
+                            passed: dock27?.slots.count == 4 && dock27?.additionalOffers.isEmpty == true,
+                            detail: "got \(describe(dock27))"))
+
+        // The gate has to bite, or agreeing proves nothing.
+        var offByOne = dockPowerCapture
+        offByOne["AdapterDetails"] = [
+            "UsbHvcMenu": menu([(5000, 3000), (9000, 3000), (15000, 3000), (20000, 4260)]),
+        ] as [String: Any]
+        checks.append(Check(name: "source caps: ten milliamps off the menu and the array is not believed",
+                            passed: PowerMonitor.sourceCapabilities(from: offByOne) == nil))
+        checks.append(Check(name: "source caps: a leftover array and request with nothing attached show nothing",
+                            passed: PowerMonitor.sourceCapabilities(from: nothingAttachedCapture) == nil))
+        checks.append(Check(name: "source caps: an empty menu shows nothing, whatever the controller holds",
+                            passed: PowerMonitor.sourceCapabilities(from: carPortCapture) == nil))
+        var twins = dockPowerCapture27
+        twins["PortControllerInfo"] = [
+            ["PortControllerPortPDO": pdoArray([0x2f11912c, 0x12d12c, 0x14b12c, 0x1641e0])] as [String: Any],
+            ["PortControllerPortPDO": pdoArray([0x2f11912c, 0x12d12c, 0x14b12c, 0x1641e0, 0xC1A4213C])] as [String: Any],
+        ] as [[String: Any]]
+        checks.append(Check(name: "source caps: two agreeing entries that differ from each other show nothing",
+                            passed: PowerMonitor.sourceCapabilities(from: twins) == nil))
+
+        // A PPS charger attached for real. The fixed words agreeing with the
+        // menu is what lets the array through at all; out of three entries,
+        // only the one describing this charger may.
+        let charger = PowerMonitor.sourceCapabilities(from: ppsChargerCapture)
+        checks.append(Check(name: "source caps: of three entries, only the attached charger's agrees",
+                            passed: charger?.slots.count == 6,
+                            detail: "got \(describe(charger))"))
+        checks.append(Check(name: "source caps: an offer past PortControllerNPDOs is kept",
+                            passed: charger?.slots.last?.position == 6))
+        let extra = charger?.additionalOffers.map(\.summary) ?? []
+        checks.append(Check(name: "source caps: a real PPS word, sign-extended, reads 5–21 V up to 4.75 A",
+                            passed: extra == ["PPS 5–21 V up to 4.75 A"],
+                            detail: "got \(extra)"))
+        // The one structural check a lone word allows: every bit the PPS
+        // layout reserves (26:25, 16 and 7) is clear, in both PPS words ever
+        // captured here. Not proof of the decode, but a word in some other
+        // encoding would be unlikely to manage it twice.
+        for pps: UInt32 in [0xc1a4_325f, 0xc1a4_3264] {
+            checks.append(Check(
+                name: "source caps: captured PPS word \(String(pps, radix: 16)) leaves the reserved bits clear",
+                passed: (pps >> 25) & 0b11 == 0 && (pps >> 16) & 1 == 0 && (pps >> 7) & 1 == 0))
+        }
+
+        // No real source has ever offered any of what follows to this Mac.
+        // These words were assembled by hand from the PD R3.2 field tables,
+        // and Linux's pd.h was used as the second reading of each layout.
+        let spec: [(word: UInt32, expected: String?, what: String)] = [
+            (0xC1A4_213C, "PPS 3.3–21 V up to 3 A", "PPS, 3.3–21 V in 100 mV, 3 A in 50 mA"),
+            (0xD3C0_968C, "AVS 15–48 V up to 140 W", "EPR AVS, 9-bit maximum, PDP in watts"),
+            (0xE004_B0E1, "AVS 9–15 V up to 3 A, 15–20 V up to 2.25 A", "SPR AVS, two current tiers"),
+            (0xE004_B000, "AVS 9–15 V up to 3 A", "SPR AVS with no 20 V tier"),
+            (0x9901_912C, "Variable 5–20 V up to 3 A", "Variable supply"),
+            (0x5901_90F0, "Battery 5–20 V up to 60 W", "Battery supply, 250 mW units"),
+            (0xF004_B0E1, nil, "the reserved APDO subtype 11b"),
+            (0x808C_8C8C, nil, "whatcable's slot-13 filler, an inverted Variable range"),
+            (0x0000_000A, nil, "a Fixed word at 0 V"),
+            (0xD3C0_9600, nil, "an EPR AVS offering 0 W"),
+            (0x9901_9000, nil, "a Variable supply offering 0 A"),
+            (0x0001_9000, nil, "a Fixed 5 V word offering 0 A"),
+        ]
+        for fixture in spec {
+            let got = SourceOffer(word: fixture.word)?.summary
+            checks.append(Check(
+                name: "source caps: \(fixture.what) → \(fixture.expected ?? "nothing")",
+                passed: got == fixture.expected,
+                detail: "got \(got ?? "nothing")"))
+        }
+
+        // Not a captured word but a reconstructed one: the panel printed
+        // "PPS 4.8–21 V up to 0 A" for a 100 W charger on 15 October, and this
+        // is the only word that decodes to that. Its voltage fields are the
+        // ones the real 4.75 A and 5 A words from this charger carry.
+        checks.append(Check(
+            name: "source caps: the 0 A PPS word shown for a 100 W charger is dropped",
+            passed: SourceOffer(word: 0xC1A4_3000) == nil
+                && SourceOffer(word: 0xC1A4_325F)?.summary == "PPS 5–21 V up to 4.75 A",
+            detail: SourceOffer(word: 0xC1A4_3000)?.summary))
+        return checks
+    }
+
+    // MARK: - Port counters
+
+    private static let portControllerCapture: [String: Any] = [
+        "PortControllerInfo": [
+            [
+                "PortControllerAttachCount": 0,
+                "PortControllerDetachCount": 0,
+                "PortControllerHardResetCount": 0,
+                "PortControllerI2cErrCount": 0,
+                "PortControllerFwVersion": 3_171_072,
+            ] as [String: Any],
+            // The same controller after a dock that keeps dropping off: the
+            // shape this feature exists to surface.
+            [
+                "PortControllerAttachCount": 214,
+                "PortControllerDetachCount": 213,
+                "PortControllerHardResetCount": 9,
+                "PortControllerI2cErrCount": 3,
+                "PortControllerVdoFailCount": 2,
+                "PortControllerFwVersion": 3_171_072,
+            ] as [String: Any],
+        ] as [[String: Any]],
+    ]
+
+    private static let usbPortCapture: [String: Any] = [
+        "UsbIOPort": "IOService:/AppleARMPE/arm-io@10F00000/AppleHPMDeviceHALType3@C/Port-USB-C@2",
+        "link-error-count": 0,
+        "port-statistics": [
+            "kPortStatConnectCount": 4,
+            "kPortStatOverCurrentCount": 0,
+            "kPortStatEnumerationFailureCount": 0,
+            "kPortStatAddressFailureCount": 0,
+            "kPortStatRemoteWakeCount": 1,
+            "kPortStatEOF2ViolationCount": 0,
+        ] as [String: Any],
+    ]
+
+    private static func portStatsChecks() -> [Check] {
+        var checks: [Check] = []
+        let controllers = PortStatsMonitor.controllers(from: portControllerCapture)
+        checks.append(Check(name: "port controllers: both entries decoded",
+                            passed: controllers.count == 2,
+                            detail: "got \(controllers.count)"))
+        guard controllers.count == 2 else { return checks }
+
+        // Unplugging a cable is not a fault. A machine that has had things
+        // plugged into it must not light up as faulty.
+        checks.append(Check(name: "port controllers: attach and detach are not faults",
+                            passed: !controllers[0].hasFaults))
+        checks.append(Check(name: "port controllers: real faults are surfaced",
+                            passed: controllers[1].hasFaults))
+        let named = controllers[1].faultCounts.map(\.name)
+        checks.append(Check(
+            name: "port controllers: fault list names what actually moved",
+            passed: named.contains("Hard resets") && named.contains("I²C errors")
+                && named.contains("Identity request failures") && named.count == 3,
+            detail: "got \(named.joined(separator: ", "))"))
+        checks.append(Check(name: "port controllers: a busy port is still not a faulty one",
+                            passed: controllers[1].attachCount == 214))
+
+        guard let usb = PortStatsMonitor.usbPort(from: usbPortCapture, id: "test") else {
+            checks.append(Check(name: "usb port: statistics decoded", passed: false,
+                                detail: "port-statistics container not found"))
+            return checks
+        }
+        checks.append(Check(name: "usb port: counters decoded", passed: usb.connectCount == 4))
+        checks.append(Check(name: "usb port: physical port read from the registry path",
+                            passed: usb.portNumber == 2,
+                            detail: "got \(usb.portNumber.map(String.init) ?? "nil")"))
+        checks.append(Check(name: "usb port: a clean port reports no faults", passed: !usb.hasFaults))
+
+        var noisy = usbPortCapture
+        noisy["port-statistics"] = [
+            "kPortStatOverCurrentCount": 2,
+            "kPortStatEnumerationFailureCount": 7,
+        ] as [String: Any]
+        let noisyStats = PortStatsMonitor.usbPort(from: noisy, id: "test")
+        checks.append(Check(name: "usb port: over-current and enumeration failures surface",
+                            passed: noisyStats?.faultCounts.count == 2))
+        checks += attributionChecks()
+        return checks
+    }
+
+    /// A machine whose USB-C ports are numbered with a gap in them, which is
+    /// the case that tells the ordinal rule apart from "offset + 1 is the port
+    /// number". Both rules agree on 1 and 2; only one of them puts the third
+    /// entry on port 4.
+    private static func gappedPorts() -> [PortInfo] {
+        [
+            PortInfo(name: "USB-C 1", kind: .usbC, number: 1, isConnected: false),
+            PortInfo(name: "USB-C 2", kind: .usbC, number: 2, isConnected: false),
+            PortInfo(name: "USB-C 4", kind: .usbC, number: 4, isConnected: false),
+        ]
+    }
+
+    private static func attributionChecks() -> [Check] {
+        var checks: [Check] = []
+        let entries = (0..<3).map { PortControllerStats(index: $0) }
+
+        let gapped = PortStatsMonitor.attributed(entries, to: gappedPorts(), channels: [])
+        checks.append(Check(
+            name: "controller attribution: ports are taken in order, not by number",
+            passed: gapped.map(\.portName) == ["USB-C 1", "USB-C 2", "USB-C 4"],
+            detail: "got \(gapped.map { $0.portName ?? "nil" }.joined(separator: ", "))"))
+
+        // Three entries against two USB-C ports and a MagSafe: this Mac's own
+        // shape, and the trailing entry is the MagSafe controller.
+        let withMagSafe = [
+            PortInfo(name: "USB-C 1", kind: .usbC, number: 1, isConnected: false),
+            PortInfo(name: "USB-C 2", kind: .usbC, number: 2, isConnected: false),
+            PortInfo(name: "MagSafe 3", kind: .magSafe, number: 1, isConnected: false),
+        ]
+        let trailing = PortStatsMonitor.attributed(entries, to: withMagSafe, channels: [])
+        checks.append(Check(
+            name: "controller attribution: the spare entry is the MagSafe controller",
+            passed: trailing.map(\.portName) == ["USB-C 1", "USB-C 2", "MagSafe 3"],
+            detail: "got \(trailing.map { $0.portName ?? "nil" }.joined(separator: ", "))"))
+
+        // Two entries against three ports fits neither count, so nothing is
+        // named. A counter on the wrong port is worse than one on no port.
+        let short = PortStatsMonitor.attributed(Array(entries.prefix(2)), to: gappedPorts(), channels: [])
+        checks.append(Check(name: "controller attribution: an unexpected count names nothing",
+                            passed: short.allSatisfy { $0.portName == nil }))
+
+        // The keyed route: offset j is SMC channel j+1, and that channel names
+        // the port's own controller. Made to disagree here — channel 1 points
+        // at the port the ordinal rule puts third — and the whole attribution
+        // has to go, not just that entry.
+        var first = PortInfo(name: "USB-C 1", kind: .usbC, number: 1, isConnected: false)
+        first.controllerUUID = "aaaa0000000000000000000000000001"
+        var third = PortInfo(name: "USB-C 4", kind: .usbC, number: 4, isConnected: false)
+        third.controllerUUID = "aaaa0000000000000000000000000003"
+        let crossed = [first, PortInfo(name: "USB-C 2", kind: .usbC, number: 2, isConnected: false), third]
+        let disagreeing = [
+            SMCMonitor.PortChannel(index: 1, controllerUUID: "aaaa0000000000000000000000000003",
+                                   sourceDescription: nil, power: nil),
+        ]
+        checks.append(Check(
+            name: "controller attribution: a keyed disagreement drops the lot",
+            passed: PortStatsMonitor.attributed(entries, to: crossed, channels: disagreeing)
+                .allSatisfy { $0.portName == nil }))
+
+        let agreeing = [
+            SMCMonitor.PortChannel(index: 1, controllerUUID: "aaaa0000000000000000000000000001",
+                                   sourceDescription: nil, power: nil),
+        ]
+        checks.append(Check(
+            name: "controller attribution: a keyed agreement lets it stand",
+            passed: PortStatsMonitor.attributed(entries, to: crossed, channels: agreeing)
+                .map(\.portName) == ["USB-C 1", "USB-C 2", "USB-C 4"]))
+        return checks
+    }
+
+    // MARK: - Thunderbolt link state
+
+    /// This Mac's `IOThunderboltPort` adapters, as read with nothing attached.
+    /// Two sockets, two link halves each, plus the adapters that are not
+    /// physical ports at all.
+    private static let thunderboltCapture: [[String: Any]] = [
+        ["Description": "Thunderbolt Native Host Interface Adapter", "Port Number": 7],
+        ["Description": "Thunderbolt Port", "Socket ID": "1", "Port Number": 1,
+         "Current Link Speed": 8, "Current Link Width": 1,
+         "Supported Link Speed": 12, "Supported Link Width": 2, "Thunderbolt Version": 32],
+        ["Description": "Thunderbolt Port", "Socket ID": "1", "Port Number": 2,
+         "Current Link Speed": 8, "Current Link Width": 1,
+         "Supported Link Speed": 12, "Supported Link Width": 2, "Thunderbolt Version": 32],
+        ["Description": "Thunderbolt Port", "Socket ID": "2", "Port Number": 1,
+         "Current Link Speed": 8, "Current Link Width": 1,
+         "Supported Link Speed": 12, "Supported Link Width": 2, "Thunderbolt Version": 32],
+        ["Description": "Thunderbolt Port", "Socket ID": "2", "Port Number": 2,
+         "Current Link Speed": 8, "Current Link Width": 1,
+         "Supported Link Speed": 12, "Supported Link Width": 2, "Thunderbolt Version": 32],
+    ]
+
+    private static func thunderboltChecks() -> [Check] {
+        var checks: [Check] = []
+        let links = ThunderboltMonitor.links(from: thunderboltCapture)
+        checks.append(Check(name: "thunderbolt: one entry per socket, host adapter ignored",
+                            passed: links.count == 2 && links[1] != nil && links[2] != nil,
+                            detail: "got \(links.count) sockets"))
+        checks.append(Check(name: "thunderbolt: controller class read from the supported mask",
+                            passed: links[1]?.capabilityLabel == "Thunderbolt 4 / USB4 — 40 Gbps",
+                            detail: "got \(links[1]?.capabilityLabel ?? "nil")"))
+
+        // The trap this reader exists to avoid: an idle port on this Mac
+        // reports a live-looking current speed and width with nothing plugged
+        // in, so the achieved link must be gated on the port's own evidence
+        // that Thunderbolt is really running.
+        var idle = PortInfo(name: "USB-C", kind: .usbC, number: 1, isConnected: false)
+        idle.thunderbolt = links[1]
+        idle.transportsActive = []
+        checks.append(Check(name: "thunderbolt: an empty port claims no achieved link",
+                            passed: idle.thunderboltAchieved == nil,
+                            detail: "got \(idle.thunderboltAchieved ?? "nil")"))
+
+        var power = idle
+        power.isConnected = true
+        power.transportsActive = ["CC"]
+        checks.append(Check(name: "thunderbolt: a charger on the port is not a Thunderbolt link",
+                            passed: power.thunderboltAchieved == nil))
+
+        var running = idle
+        running.isConnected = true
+        running.transportsActive = ["CC", "CIO"]
+        var fast = links[1]
+        fast?.currentSpeedCode = 0x4
+        fast?.currentWidth = 2
+        running.thunderbolt = fast
+        checks.append(Check(name: "thunderbolt: a real link reports its lanes and rate",
+                            passed: running.thunderboltAchieved == "40 Gbps (2 lanes)",
+                            detail: "got \(running.thunderboltAchieved ?? "nil")"))
+
+        // A TB5 controller, which this Mac is not, so the mask has to be read
+        // rather than assumed from the machine it was written on.
+        let tb5 = ThunderboltMonitor.links(from: [[
+            "Description": "Thunderbolt Port", "Socket ID": "1",
+            "Supported Link Speed": 14, "Supported Link Width": 2,
+        ]])
+        checks.append(Check(name: "thunderbolt: a TB5-capable controller is recognised",
+                            passed: tb5[1]?.capabilityLabel == "Thunderbolt 5 / USB4 v2 — 80 Gbps",
+                            detail: "got \(tb5[1]?.capabilityLabel ?? "nil")"))
+
+        // An unknown speed code must vanish, not be guessed at.
+        let odd = ThunderboltMonitor.links(from: [[
+            "Description": "Thunderbolt Port", "Socket ID": "1",
+            "Supported Link Speed": 1, "Supported Link Width": 2,
+        ]])
+        checks.append(Check(name: "thunderbolt: an unknown speed code reports nothing",
+                            passed: odd[1]?.capabilityLabel == nil))
+        return checks
+    }
+
+    // MARK: - Liquid detection
+
+    /// A dry port on this Mac, verbatim.
+    private static let dryPort: [String: Any] = [
+        "FeatureTypeDescription": "LDCM",
+        "LiquidDetected": false,
+        "StateDescription": "Hardware Controlled",
+        "MitigationsEnabled": false,
+        "MitigationsStatus": 0,
+        "UserOverrideActive": false,
+    ]
+
+    private static func liquidChecks() -> [Check] {
+        var checks: [Check] = []
+        let dry = PortMonitor.liquidDetection(from: dryPort)
+        // A dry port is the case that must stay silent, and it is the only one
+        // that can be tested against real hardware without ruining a laptop.
+        checks.append(Check(name: "liquid: a dry port says nothing",
+                            passed: !dry.isNoteworthy && dry.summary == nil))
+        checks.append(Check(name: "liquid: the controller's own state is read",
+                            passed: dry.state == "Hardware Controlled"))
+
+        var wet = dryPort
+        wet["LiquidDetected"] = true
+        let detected = PortMonitor.liquidDetection(from: wet)
+        checks.append(Check(name: "liquid: a detection is noteworthy",
+                            passed: detected.isNoteworthy
+                                && detected.summary == "Liquid detected in this port"))
+
+        var held = wet
+        held["MitigationsStatus"] = 2
+        checks.append(Check(
+            name: "liquid: a detection that is cutting the port says both",
+            passed: PortMonitor.liquidDetection(from: held).summary
+                == "Liquid detected — this port is being held down"))
+
+        // Mitigation without a current detection: the port is still being held
+        // down, and saying nothing would leave a dead port unexplained.
+        var latched = dryPort
+        latched["MitigationsStatus"] = 1
+        let stillHeld = PortMonitor.liquidDetection(from: latched)
+        checks.append(Check(name: "liquid: a held-down port is explained even once dry",
+                            passed: stillHeld.isNoteworthy
+                                && stillHeld.summary == "This port is being held down by liquid mitigation"))
+
+        // A node that is not the liquid circuit must not be read as one.
+        let notLDCM = PortMonitor.liquidDetection(from: ["FeatureTypeDescription": "Power In"])
+        checks.append(Check(name: "liquid: absent keys default to a dry, quiet port",
+                            passed: !notLDCM.isNoteworthy))
+        return checks
+    }
+
+    // MARK: - Lane assignment
+
+    /// The Lenovo ThinkStation monitor capture: a display over USB-C that took
+    /// both high-speed lanes at HBR3, leaving the dock's own devices on USB 2.0.
+    /// This is the shape the whole feature exists to explain, and it only
+    /// occurs while a display is attached.
+    private static let displayPhyCapture: [String: Any] = [
+        "AppleTypeCPhyID": 1,
+        "AppleTypeCPhyLane": [
+            "Lane 0": [
+                "Transport": "DisplayPort", "Power Level": "on",
+                "Client": "AppleATCDPAltModePort(atc1-dpphy)",
+            ] as [String: Any],
+            "Lane 1": [
+                "Transport": "DisplayPort", "Power Level": "on",
+                "Client": "AppleATCDPAltModePort(atc1-dpphy)",
+            ] as [String: Any],
+        ] as [String: Any],
+        "AppleTypeCPhyDisplayPortPclk": [
+            "PCLK 1": [
+                "Clients": ["AppleATCDPAltModePort(atc1-dpphy)"],
+                "Link Rate": "8.10Gbps/lane (HBR3)",
+            ] as [String: Any],
+        ] as [String: Any],
+        "AppleTypeCPhyDisplayPortTunnel": [:] as [String: Any],
+        "AppleTypeCPhyUSB2": [
+            "Transport": "USB2", "Power Level": "on", "Client": "AppleT8132USBXHCI",
+        ] as [String: Any],
+    ]
+
+    /// The same Mac's other PHY in the same capture: nothing attached.
+    private static let idlePhyCapture: [String: Any] = [
+        "AppleTypeCPhyID": 0,
+        "AppleTypeCPhyLane": ["Lane 0": [:] as [String: Any], "Lane 1": [:] as [String: Any]] as [String: Any],
+        "AppleTypeCPhyDisplayPortPclk": [:] as [String: Any],
+        "AppleTypeCPhyUSB2": [:] as [String: Any],
+    ]
+
+    private static func phyChecks() -> [Check] {
+        var checks: [Check] = []
+        guard let display = PhyMonitor.phy(from: displayPhyCapture),
+              let idle = PhyMonitor.phy(from: idlePhyCapture)
+        else {
+            return [Check(name: "lanes: captures decoded", passed: false)]
+        }
+
+        checks.append(Check(name: "lanes: both lanes read as DisplayPort",
+                            passed: display.laneSummary == "Both lanes: DisplayPort",
+                            detail: "got \(display.laneSummary ?? "nil")"))
+        // 8.10 per lane across the two lanes actually carrying the display.
+        checks.append(Check(name: "lanes: display bandwidth is summed over its own lanes",
+                            passed: display.displaySummary == "16.2 Gbps over 2 lanes HBR3",
+                            detail: "got \(display.displaySummary ?? "nil")"))
+        checks.append(Check(name: "lanes: the rate name comes from the controller's string",
+                            passed: display.displayLinkRate == "8.10Gbps/lane (HBR3)"))
+        checks.append(Check(name: "lanes: the USB 2.0 pair is read separately",
+                            passed: display.usb2Transport == "USB2"))
+        checks.append(Check(name: "lanes: a display on both lanes is flagged",
+                            passed: display.takesAllLanesForDisplay))
+
+        // An unpowered lane is not an assignment.
+        checks.append(Check(name: "lanes: an idle port claims no lane assignment",
+                            passed: idle.laneSummary == nil && !idle.takesAllLanesForDisplay))
+        checks.append(Check(name: "lanes: an idle port claims no display",
+                            passed: idle.displaySummary == nil))
+
+        // The consequence is only stated about a port with something on it.
+        var empty = PortInfo(name: "USB-C", kind: .usbC, number: 2, isConnected: false)
+        empty.phy = display
+        checks.append(Check(name: "lanes: no lane verdict on a port with nothing plugged in",
+                            passed: !empty.displayIsUsingAllLanes))
+        var occupied = empty
+        occupied.isConnected = true
+        checks.append(Check(name: "lanes: the USB 2.0 consequence is stated when connected",
+                            passed: occupied.displayIsUsingAllLanes))
+
+        // One lane for display and one for USB3 is a real and different case.
+        var mixed = displayPhyCapture
+        mixed["AppleTypeCPhyLane"] = [
+            "Lane 0": ["Transport": "DisplayPort", "Power Level": "on"] as [String: Any],
+            "Lane 1": ["Transport": "USB3", "Power Level": "on"] as [String: Any],
+        ] as [String: Any]
+        let split = PhyMonitor.phy(from: mixed)
+        checks.append(Check(name: "lanes: a split assignment names both transports",
+                            passed: split?.laneSummary == "Both lanes: DisplayPort + USB3",
+                            detail: "got \(split?.laneSummary ?? "nil")"))
+        checks.append(Check(name: "lanes: a split assignment is not a display taking everything",
+                            passed: split?.takesAllLanesForDisplay == false))
+        checks.append(Check(name: "lanes: display bandwidth counts only the display's lane",
+                            passed: split?.displaySummary == "8.1 Gbps over 1 lane HBR3",
+                            detail: "got \(split?.displaySummary ?? "nil")"))
+        return checks
+    }
+
+    // MARK: - Displays
+
+    private static func displayChecks() -> [Check] {
+        var checks: [Check] = []
+
+        // A 4K60 panel: 3840 x 2160 x 60 x 24 bits, plus 8b/10b, is ~14.9 Gbps
+        // before a single line of blanking.
+        var uhd = DisplayInfo(id: 1)
+        uhd.pixelWidth = 3840; uhd.pixelHeight = 2160; uhd.refreshHz = 60
+        let floor = uhd.minimumGbps ?? 0
+        checks.append(Check(name: "display: 4K60's uncompressed floor is about 14.9 Gbps",
+                            passed: floor > 14.8 && floor < 15.0,
+                            detail: String(format: "got %.2f", floor)))
+
+        // Both lanes at HBR3 is 16.2 Gbps, which clears the floor — and the
+        // app must still say nothing, because the floor understates the need.
+        checks.append(Check(name: "display: nothing is claimed when a mode appears to fit",
+                            passed: !uhd.cannotFitUncompressed(in: 16.2)
+                                && uhd.compressionVerdict(linkGbps: 16.2) == nil))
+
+        // One lane at HBR3 is 8.1 Gbps. The floor alone exceeds it, so the
+        // picture provably cannot be uncompressed.
+        checks.append(Check(name: "display: a mode over the floor is proved compressed",
+                            passed: uhd.cannotFitUncompressed(in: 8.1)))
+        let verdict = uhd.compressionVerdict(linkGbps: 8.1) ?? ""
+        checks.append(Check(name: "display: the verdict states both figures",
+                            passed: verdict.contains("14.9") && verdict.contains("8.1")
+                                && verdict.contains("DSC"),
+                            detail: verdict))
+
+        // A mode with nothing in it must not produce arithmetic.
+        let blank = DisplayInfo(id: 2)
+        checks.append(Check(name: "display: an unread mode computes nothing",
+                            passed: blank.minimumGbps == nil
+                                && !blank.cannotFitUncompressed(in: 1)))
+
+        // Attribution: unambiguous or not at all.
+        var builtIn = DisplayInfo(id: 3); builtIn.isBuiltIn = true
+        var one = DisplayInfo(id: 4); one.pixelWidth = 2560; one.pixelHeight = 1440; one.refreshHz = 60
+        var two = DisplayInfo(id: 5); two.pixelWidth = 1920; two.pixelHeight = 1080; two.refreshHz = 60
+        checks.append(Check(name: "display: the built-in panel is never the external one",
+                            passed: DisplayMonitor.soleExternal(from: [builtIn]) == nil))
+        checks.append(Check(name: "display: one external display attributes",
+                            passed: DisplayMonitor.soleExternal(from: [builtIn, one])?.id == 4))
+        checks.append(Check(name: "display: two external displays attribute to neither",
+                            passed: DisplayMonitor.soleExternal(from: [builtIn, one, two]) == nil))
+
+        // The port-level verdict needs both halves; neither alone will do.
+        var port = PortInfo(name: "USB-C", kind: .usbC, number: 2, isConnected: true)
+        port.display = uhd
+        checks.append(Check(name: "display: no verdict without a known link rate",
+                            passed: port.displayCompression == nil))
+        return checks
+    }
+}

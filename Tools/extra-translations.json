@@ -1,0 +1,4 @@
+{
+  "macOS only lets root change this setting, and there is no API for it — pmset is the only way in.\n\nWattson can install a rule granting your account permission to run that one command, with those exact arguments, without a password. It grants nothing else, and you can remove it in Settings at any time.\n\n%@": "macOS 仅允许 root 更改此设置，且未提供相应 API，因此需要使用 pmset。\n\nWattson 可为当前账户安装一条规则，允许免密码执行这一条命令及指定参数，不会授予其他权限。你可以随时在设置中撤销授权。\n\n%@",
+  "Wattson will forget every attach and detach it has recorded, for every device. Anything still plugged in will start a fresh history from now.\n\nThis cannot be undone.": "Wattson 将清除所有设备已记录的连接和断开事件。当前仍连接的设备将从现在开始重新记录历史。\n\n此操作无法撤销。"
+}
